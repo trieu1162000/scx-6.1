@@ -27,6 +27,8 @@ members = [
     "scheds/rust/scx_layered",
     "scheds/rust/scx_mitosis",
     "scheds/rust/scx_p2dq",
+    "scheds/k6.1/scx_p2dq",
+    "scheds/k6.1/scx_lavd",
     "scheds/rust/scx_pandemonium",
     "scheds/rust/scx_rusty",
     "scheds/experimental/scx_flow",

@@ -1273,6 +1273,8 @@ volatile u32 bpf_arena_loop_zero __weak = 0;
 #include "compat.bpf.h"
 #include "enums.bpf.h"
 #include "features.bpf.h"
+#ifndef SCX_FCP_ANDROID_61
 #include "cid.bpf.h"
+#endif
 
 #endif	/* __SCX_COMMON_BPF_H */

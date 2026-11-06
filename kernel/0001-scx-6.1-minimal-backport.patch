@@ -1,0 +1,2577 @@
+From 8b2366feb91a1da72f616405979b954bc80f07a9 Mon Sep 17 00:00:00 2001
+From: Nhat-Trieu Huynh-Pham <trieu2.huynh@lge.com>
+Date: Wed, 4 Nov 2026 23:35:19 +0700
+Subject: [PATCH] sched_ext: minimal Linux 6.1 backport for
+ scx_lavd/scx_p2dq/scx_fcp
+
+Backport the sched_ext plumbing required to run the scx BPF schedulers on
+android14-6.1: struct_ops sleepable programs and BPF links, kfunc
+registration hooks, the ext core and fair.c call sites, and the verifier
+relaxation for non-scalar global subprogs.
+
+This is the reduced form of the earlier vendor series:
+
+  - drop the unrelated goldfish address-space/sync driver rewrite and the
+    dma-buf heaps Makefile edit, so enabling sched_ext no longer drags in
+    unrelated drivers and kernel threads that would perturb measurements
+  - drop the VIRTIO/GOLDFISH/USB/CPUFREQ select lines from the
+    SCHED_CLASS_EXT Kconfig entry
+  - fix bpf_cpumask_populate(), which parsed a text mask from a user
+    pointer instead of copying the raw bitmap from BPF memory
+  - make bpf_cpumask_any_distribute()/any_and_distribute() actually
+    spread picks instead of always returning the lowest CPU
+
+The remaining architectural differences from upstream sched_ext (CFS
+hooks instead of ext_sched_class, per-CPU DSQs, single global idle mask)
+are documented in review/BACKPORT_MINIMAL_REVIEW.md and must be accounted
+for in any measurement comparison.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ include/linux/bpf.h               |    2 +-
+ include/linux/sched.h             |   14 +-
+ include/linux/sched/ext.h         |  217 ++++
+ kernel/Kconfig.preempt            |    9 +
+ kernel/bpf/bpf_struct_ops.c       |   73 +-
+ kernel/bpf/bpf_struct_ops_types.h |    2 +
+ kernel/bpf/btf.c                  |   74 +-
+ kernel/bpf/syscall.c              |   18 +
+ kernel/bpf/verifier.c             |   45 +-
+ kernel/sched/Makefile             |    2 +
+ kernel/sched/ext.c                | 1734 +++++++++++++++++++++++++++++
+ kernel/sched/fair.c               |   28 +-
+ 12 files changed, 2194 insertions(+), 24 deletions(-)
+ create mode 100644 include/linux/sched/ext.h
+ create mode 100644 kernel/sched/ext.c
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 3177b1b9d1ff..9d394a226b86 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1438,7 +1438,7 @@ struct bpf_array {
+ 	};
+ };
+ 
+-#define BPF_COMPLEXITY_LIMIT_INSNS      1000000 /* yes. 1M insns */
++#define BPF_COMPLEXITY_LIMIT_INSNS      4000000 /* raised for the merged-TU sched_ext port */
+ #define MAX_TAIL_CALL_CNT 33
+ 
+ /* Maximum number of loops for bpf_loop */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 9f554573daa4..7a2edf839e8a 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -749,6 +749,18 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++struct sched_ext_entity {
++	u64			dsq_vtime;
++	u64			slice;
++	u16			dsq_slot;
++	s16			selected_cpu;
++	s16			queued_cpu;
++	u16			magic;
++	u32			weight;
++	u32			flags;
++	struct list_head	node;
++};
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -1519,7 +1531,7 @@ struct task_struct {
+ 	int				mce_count;
+ #endif
+ 	ANDROID_VENDOR_DATA_ARRAY(1, 64);
+-	ANDROID_OEM_DATA_ARRAY(1, 6);
++	_ANDROID_KABI_REPLACE(ANDROID_OEM_DATA_ARRAY(1, 6), struct sched_ext_entity scx);
+ 
+ #ifdef CONFIG_KRETPROBES
+ 	struct llist_head               kretprobe_instances;
+diff --git a/include/linux/sched/ext.h b/include/linux/sched/ext.h
+new file mode 100644
+index 000000000000..edc3be5dafe9
+--- /dev/null
++++ b/include/linux/sched/ext.h
+@@ -0,0 +1,217 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_SCHED_EXT_H
++#define _LINUX_SCHED_EXT_H
++
++#include <linux/types.h>
++#include <linux/cpumask.h>
++#include <linux/sched.h>
++
++enum scx_public_consts {
++	SCX_OPS_NAME_LEN	= 128,
++	SCX_SLICE_DFL		= 20 * 1000000ULL,
++	SCX_SLICE_BYPASS	= 5 * 1000000ULL,
++	SCX_SLICE_INF		= ~0ULL,
++};
++
++enum scx_consts {
++	SCX_DSP_DFL_MAX_BATCH	= 32,
++	SCX_DSP_MAX_LOOPS	= 32,
++	SCX_WATCHDOG_MAX_TIMEOUT = 30 * HZ,
++	SCX_RESCUE_DISABLE	= ~0U,
++	SCX_EXIT_BT_LEN		= 64,
++	SCX_EXIT_MSG_LEN	= 1024,
++	SCX_EXIT_DUMP_DFL_LEN	= 32768,
++	SCX_CPUPERF_ONE		= 1024,
++};
++
++enum scx_dsq_id_flags {
++	SCX_DSQ_FLAG_BUILTIN	= (1ULL << 63),
++	SCX_DSQ_FLAG_LOCAL_ON	= (1ULL << 62),
++	SCX_DSQ_INVALID		= SCX_DSQ_FLAG_BUILTIN | 0,
++	SCX_DSQ_GLOBAL		= SCX_DSQ_FLAG_BUILTIN | 1,
++	SCX_DSQ_LOCAL		= SCX_DSQ_FLAG_BUILTIN | 2,
++	SCX_DSQ_BYPASS		= SCX_DSQ_FLAG_BUILTIN | 3,
++	SCX_DSQ_REJECT		= SCX_DSQ_FLAG_BUILTIN | 4,
++	SCX_DSQ_RESCUE		= SCX_DSQ_FLAG_BUILTIN | 5,
++	SCX_DSQ_LOCAL_ON	= SCX_DSQ_FLAG_BUILTIN | SCX_DSQ_FLAG_LOCAL_ON,
++	SCX_DSQ_LOCAL_CPU_MASK	= 0xffffffffULL,
++};
++
++enum scx_ent_flags {
++	SCX_TASK_QUEUED		= 1 << 0,
++	SCX_TASK_IN_CUSTODY	= 1 << 1,
++	SCX_TASK_RESET_RUNNABLE_AT = 1 << 2,
++	SCX_TASK_DEQD_FOR_SLEEP	= 1 << 3,
++	SCX_TASK_SUB_INIT	= 1 << 4,
++	SCX_TASK_IMMED		= 1 << 5,
++	SCX_TASK_PROTECTED	= 1 << 6,
++	SCX_TASK_STATE_SHIFT	= 8,
++	SCX_TASK_STATE_BITS	= 3,
++	SCX_TASK_STATE_MASK	= ((1 << SCX_TASK_STATE_BITS) - 1) << SCX_TASK_STATE_SHIFT,
++	SCX_TASK_NONE		= 0 << SCX_TASK_STATE_SHIFT,
++	SCX_TASK_INIT_BEGIN	= 1 << SCX_TASK_STATE_SHIFT,
++	SCX_TASK_INIT		= 2 << SCX_TASK_STATE_SHIFT,
++	SCX_TASK_READY		= 3 << SCX_TASK_STATE_SHIFT,
++	SCX_TASK_ENABLED	= 4 << SCX_TASK_STATE_SHIFT,
++	SCX_TASK_DEAD		= 5 << SCX_TASK_STATE_SHIFT,
++	SCX_TASK_CURSOR		= 1U << 31,
++};
++
++enum scx_ent_dsq_flags {
++	SCX_TASK_DSQ_ON_PRIQ	= 1 << 0,
++};
++
++enum scx_rq_flags {
++	SCX_RQ_ONLINE		= 1 << 0,
++	SCX_RQ_CAN_STOP_TICK	= 1 << 1,
++	SCX_RQ_CLK_VALID	= 1 << 2,
++	SCX_RQ_IN_WAKEUP	= 1 << 3,
++	SCX_RQ_IN_DISPATCH	= 1 << 4,
++};
++
++enum scx_kick_flags {
++	SCX_KICK_IDLE		= 1ULL << 0,
++	SCX_KICK_PREEMPT	= 1ULL << 1,
++	SCX_KICK_WAIT		= 1ULL << 2,
++	SCX_KICK_PREEMPT_LAZY	= 1ULL << 3,
++	SCX_KICK_ALL_FLAGS	= SCX_KICK_IDLE | SCX_KICK_PREEMPT | SCX_KICK_WAIT | SCX_KICK_PREEMPT_LAZY,
++};
++
++enum scx_enq_flags {
++	SCX_ENQ_WAKEUP		= 1ULL,
++	SCX_ENQ_HEAD		= 16ULL,
++	SCX_ENQ_CPU_SELECTED	= 1024ULL,
++	SCX_ENQ_PREEMPT		= 1ULL << 32,
++	SCX_ENQ_IMMED		= 1ULL << 33,
++	SCX_ENQ_RESCUE		= 1ULL << 34,
++	SCX_ENQ_PREEMPT_LAZY	= 1ULL << 35,
++	SCX_ENQ_BLOCKED		= 1ULL << 36,
++	SCX_ENQ_REENQ		= 1ULL << 40,
++	SCX_ENQ_LAST		= 1ULL << 41,
++	SCX_ENQ_CLEAR_OPSS	= 1ULL << 56,
++	SCX_ENQ_DSQ_PRIQ	= 1ULL << 57,
++};
++
++enum scx_deq_flags {
++	SCX_DEQ_SLEEP		= 1ULL,
++	SCX_DEQ_CORE_SCHED_EXEC	= 1ULL << 32,
++	SCX_DEQ_SCHED_CHANGE	= 1ULL << 33,
++};
++
++enum scx_exit_kind {
++	SCX_EXIT_NONE		= 0,
++	SCX_EXIT_DONE		= 1,
++	SCX_EXIT_UNREG		= 64,
++	SCX_EXIT_UNREG_BPF	= 65,
++	SCX_EXIT_UNREG_KERN	= 66,
++	SCX_EXIT_SYSRQ		= 67,
++	SCX_EXIT_ERROR		= 1024,
++	SCX_EXIT_ERROR_BPF	= 1025,
++	SCX_EXIT_ERROR_STALL	= 1026,
++};
++
++struct scx_exit_info {
++	enum scx_exit_kind	kind;
++	s32			exit_cpu;
++	s64			exit_code;
++	u64			flags;
++	const char		*reason;
++	unsigned long		*bt;
++	u32			bt_len;
++	char			*msg;
++	char			*dump;
++};
++
++struct scx_init_task_args {
++	bool			fork;
++	struct cgroup		*cgroup;
++};
++
++struct scx_exit_task_args {
++	bool			cancelled;
++};
++
++enum scx_cpu_preempt_reason {
++	SCX_CPU_PREEMPT_RT,
++	SCX_CPU_PREEMPT_DL,
++	SCX_CPU_PREEMPT_STOP,
++	SCX_CPU_PREEMPT_UNKNOWN,
++};
++
++struct scx_cpu_acquire_args {};
++
++struct scx_cpu_release_args {
++	enum scx_cpu_preempt_reason reason;
++	struct task_struct	*task;
++};
++
++struct scx_dump_ctx {
++	enum scx_exit_kind	kind;
++	s64			exit_code;
++	const char		*reason;
++	u64			at_ns;
++	u64			at_jiffies;
++};
++
++struct scx_bpf_dsq_insert_vtime_args {
++	u64			dsq_id;
++	u64			slice;
++	u64			vtime;
++	u64			enq_flags;
++};
++
++struct sched_ext_ops {
++	s32 (*select_cpu)(struct task_struct *p, s32 prev_cpu, u64 wake_flags);
++	void (*enqueue)(struct task_struct *p, u64 enq_flags);
++	void (*dequeue)(struct task_struct *p, u64 deq_flags);
++	void (*dispatch)(s32 cpu, struct task_struct *prev);
++	void (*tick)(struct task_struct *p);
++	void (*runnable)(struct task_struct *p, u64 enq_flags);
++	void (*running)(struct task_struct *p);
++	void (*stopping)(struct task_struct *p, bool runnable);
++	void (*quiescent)(struct task_struct *p, u64 deq_flags);
++	bool (*yield)(struct task_struct *from, struct task_struct *to);
++	bool (*core_sched_before)(struct task_struct *a, struct task_struct *b);
++	void (*set_weight)(struct task_struct *p, u32 weight);
++	void (*set_cpumask)(struct task_struct *p, const struct cpumask *cpumask);
++	void (*update_idle)(s32 cpu, bool idle);
++	s32 (*init_task)(struct task_struct *p, struct scx_init_task_args *args);
++	void (*exit_task)(struct task_struct *p, struct scx_exit_task_args *args);
++	void (*enable)(struct task_struct *p);
++	void (*disable)(struct task_struct *p);
++	void (*dump)(struct scx_dump_ctx *ctx);
++	void (*dump_cpu)(struct scx_dump_ctx *ctx, s32 cpu, bool idle);
++	void (*dump_task)(struct scx_dump_ctx *ctx, struct task_struct *p);
++	void (*cpu_online)(s32 cpu);
++	void (*cpu_offline)(s32 cpu);
++	s32 (*init)(void);
++	void (*exit)(struct scx_exit_info *info);
++
++	u32 dispatch_max_batch;
++	u64 flags;
++	u32 timeout_ms;
++	u32 exit_dump_len;
++	u64 hotplug_seq;
++	char name[SCX_OPS_NAME_LEN];
++	void *priv;
++	void (*cpu_acquire)(s32 cpu, struct scx_cpu_acquire_args *args);
++	void (*cpu_release)(s32 cpu, struct scx_cpu_release_args *args);
++};
++
++struct rq;
++struct sched_entity;
++
++bool scx_enabled(void);
++void scx_task_fork(struct task_struct *p);
++void scx_task_picked_fallback(struct task_struct *p);
++int scx_select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags);
++void scx_enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags);
++void scx_dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags);
++void scx_put_prev_task_fair(struct rq *rq, struct task_struct *prev);
++void scx_replace_next_task_fair(struct rq *rq, struct task_struct **p_out,
++				struct sched_entity **se_out, bool *repick_out,
++				struct task_struct *prev);
++void scx_task_tick_fair(struct rq *rq, struct task_struct *curr, int queued);
++void scx_notify_pick_idle(int cpu);
++
++#endif /* _LINUX_SCHED_EXT_H */
+diff --git a/kernel/Kconfig.preempt b/kernel/Kconfig.preempt
+index c2f1fd95a821..576707077b30 100644
+--- a/kernel/Kconfig.preempt
++++ b/kernel/Kconfig.preempt
+@@ -134,3 +134,12 @@ config SCHED_CORE
+ 	  be no measurable impact on performance.
+ 
+ 
++
++config SCHED_CLASS_EXT
++	bool "Extensible Scheduling Class (sched_ext)"
++	depends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF
++	default y
++	help
++	  This option enables the BPF extensible scheduler class (sched_ext),
++	  allowing scheduling policies to be implemented as BPF struct_ops
++	  programs.
+diff --git a/kernel/bpf/bpf_struct_ops.c b/kernel/bpf/bpf_struct_ops.c
+index 84b2d9dba79a..59a25498cfc9 100644
+--- a/kernel/bpf/bpf_struct_ops.c
++++ b/kernel/bpf/bpf_struct_ops.c
+@@ -575,6 +575,10 @@ static void bpf_struct_ops_map_free(struct bpf_map *map)
+ {
+ 	struct bpf_struct_ops_map *st_map = (struct bpf_struct_ops_map *)map;
+ 
++	if (cmpxchg(&st_map->kvalue.state, BPF_STRUCT_OPS_STATE_INUSE,
++		    BPF_STRUCT_OPS_STATE_TOBEFREE) == BPF_STRUCT_OPS_STATE_INUSE)
++		st_map->st_ops->unreg(&st_map->kvalue.data);
++
+ 	if (st_map->links)
+ 		bpf_struct_ops_map_put_progs(st_map);
+ 	bpf_map_area_free(st_map->links);
+@@ -586,7 +590,7 @@ static void bpf_struct_ops_map_free(struct bpf_map *map)
+ static int bpf_struct_ops_map_alloc_check(union bpf_attr *attr)
+ {
+ 	if (attr->key_size != sizeof(unsigned int) || attr->max_entries != 1 ||
+-	    attr->map_flags || !attr->btf_vmlinux_value_type_id)
++	    (attr->map_flags & ~(1U << 13)) || !attr->btf_vmlinux_value_type_id)
+ 		return -EINVAL;
+ 	return 0;
+ }
+@@ -699,3 +703,70 @@ void bpf_struct_ops_put(const void *kdata)
+ 		call_rcu(&st_map->rcu, bpf_struct_ops_put_rcu);
+ 	}
+ }
++
++struct bpf_struct_ops_map_link {
++	struct bpf_link link;
++	struct bpf_map *map;
++};
++
++static void bpf_struct_ops_map_link_release(struct bpf_link *link)
++{
++	struct bpf_struct_ops_map_link *st_link =
++		container_of(link, struct bpf_struct_ops_map_link, link);
++	u32 zero = 0;
++
++	bpf_struct_ops_map_delete_elem(st_link->map, &zero);
++}
++
++static void bpf_struct_ops_map_link_dealloc(struct bpf_link *link)
++{
++	struct bpf_struct_ops_map_link *st_link =
++		container_of(link, struct bpf_struct_ops_map_link, link);
++
++	bpf_map_put(st_link->map);
++	kfree(st_link);
++}
++
++static const struct bpf_link_ops bpf_struct_ops_map_link_lops = {
++	.release = bpf_struct_ops_map_link_release,
++	.dealloc = bpf_struct_ops_map_link_dealloc,
++};
++
++int bpf_struct_ops_link_create(const union bpf_attr *attr)
++{
++	struct bpf_struct_ops_map_link *st_link;
++	struct bpf_link_primer link_primer;
++	struct bpf_map *map;
++	int err;
++
++	map = bpf_map_get(attr->link_create.prog_fd);
++	if (IS_ERR(map))
++		return PTR_ERR(map);
++
++	if (map->map_type != BPF_MAP_TYPE_STRUCT_OPS) {
++		err = -EINVAL;
++		goto err_put;
++	}
++
++	st_link = kzalloc(sizeof(*st_link), GFP_USER);
++	if (!st_link) {
++		err = -ENOMEM;
++		goto err_put;
++	}
++
++	bpf_link_init(&st_link->link, BPF_LINK_TYPE_STRUCT_OPS,
++		      &bpf_struct_ops_map_link_lops, NULL);
++	st_link->map = map;
++
++	err = bpf_link_prime(&st_link->link, &link_primer);
++	if (err) {
++		kfree(st_link);
++		goto err_put;
++	}
++
++	return bpf_link_settle(&link_primer);
++
++err_put:
++	bpf_map_put(map);
++	return err;
++}
+diff --git a/kernel/bpf/bpf_struct_ops_types.h b/kernel/bpf/bpf_struct_ops_types.h
+index 5678a9ddf817..6db90e0b71dd 100644
+--- a/kernel/bpf/bpf_struct_ops_types.h
++++ b/kernel/bpf/bpf_struct_ops_types.h
+@@ -2,6 +2,8 @@
+ /* internal file - do not include directly */
+ 
+ #ifdef CONFIG_BPF_JIT
++#include <linux/sched/ext.h>
++BPF_STRUCT_OPS_TYPE(sched_ext_ops)
+ #ifdef CONFIG_NET
+ BPF_STRUCT_OPS_TYPE(bpf_dummy_ops)
+ #endif
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index c67f32f49c92..8b4b55083938 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -3260,7 +3260,13 @@ static int btf_find_kptr(const struct btf *btf, const struct btf_type *t,
+ 	else if (!strcmp("kptr_ref", __btf_name_by_offset(btf, t->name_off)))
+ 		type = BPF_KPTR_REF;
+ 	else
+-		return -EINVAL;
++		/*
++		 * Not a kptr: another type tag (e.g. "arena") on a pointer
++		 * member must not fail the whole map. Returning an error here
++		 * used to make btf_parse_kptrs() fail, which silently
++		 * disabled kptr support for every map holding such a struct.
++		 */
++		return BTF_FIELD_IGNORE;
+ 
+ 	/* Get the base type */
+ 	t = btf_type_skip_modifiers(btf, t->type, &res_id);
+@@ -3296,9 +3302,6 @@ static int btf_find_struct_field(const struct btf *btf, const struct btf_type *t
+ 			/* valid C code cannot generate such BTF */
+ 			return -EINVAL;
+ 		off /= 8;
+-		if (off % align)
+-			return -EINVAL;
+-
+ 		switch (field_type) {
+ 		case BTF_FIELD_SPIN_LOCK:
+ 		case BTF_FIELD_TIMER:
+@@ -3319,6 +3322,14 @@ static int btf_find_struct_field(const struct btf *btf, const struct btf_type *t
+ 
+ 		if (ret == BTF_FIELD_IGNORE)
+ 			continue;
++		/*
++		 * Only the members that actually matched the field type have
++		 * to satisfy its alignment. Checking every member rejected any
++		 * struct with, say, a u32 at byte offset 4, which silently
++		 * dropped kptr support for the whole map.
++		 */
++		if (off % align)
++			return -EINVAL;
+ 		if (idx >= info_cnt)
+ 			return -E2BIG;
+ 		++idx;
+@@ -6255,6 +6266,38 @@ static bool btf_is_kfunc_arg_mem_size(const struct btf *btf,
+ 	return true;
+ }
+ 
++static bool btf_type_is_cpumask(const struct btf *btf, u32 type_id)
++{
++	const struct btf_type *t;
++	const char *name;
++
++	if (!btf)
++		return false;
++	t = btf_type_skip_modifiers(btf, type_id, NULL);
++	if (!t || !__btf_type_is_struct(t))
++		return false;
++	name = btf_name_by_offset(btf, t->name_off);
++	if (!name || !*name)
++		return false;
++	return !strcmp(name, "cpumask") || !strcmp(name, "bpf_cpumask");
++}
++
++/*
++ * A kfunc argument of type "struct cpumask *" or "struct bpf_cpumask *".
++ * The two are interchangeable at the ABI level: struct bpf_cpumask starts
++ * with a struct cpumask.
++ */
++static bool btf_is_kfunc_cpumask_arg(const struct btf *btf,
++				     const struct btf_param *arg)
++{
++	const struct btf_type *t;
++
++	t = btf_type_skip_modifiers(btf, arg->type, NULL);
++	if (!t || !btf_type_is_ptr(t))
++		return false;
++	return btf_type_is_cpumask(btf, t->type);
++}
++
+ static int btf_check_func_arg_match(struct bpf_verifier_env *env,
+ 				    const struct btf *btf, u32 func_id,
+ 				    struct bpf_reg_state *regs,
+@@ -6451,6 +6494,21 @@ static int btf_check_func_arg_match(struct bpf_verifier_env *env,
+ 					i, btf_type_str(t));
+ 				return -EINVAL;
+ 			}
++		} else if (is_kfunc && base_type(reg->type) == PTR_TO_BTF_ID &&
++			   btf_is_kfunc_cpumask_arg(btf, &args[i]) &&
++			   btf_type_is_cpumask(reg->btf, reg->btf_id)) {
++			/*
++			 * struct bpf_cpumask embeds a struct cpumask as its first
++			 * member, and the sched_ext kfuncs accept either form for
++			 * their cpumask arguments. This also has to work for the
++			 * untrusted pointer a __kptr load produces, which the
++			 * generic PTR_TO_BTF_ID path below does not accept.
++			 */
++			if (reg->off) {
++				bpf_log(log, "R%d has non-zero offset %d for cpumask arg\n",
++					regno, reg->off);
++				return -EINVAL;
++			}
+ 		} else if (is_kfunc && (reg->type == PTR_TO_BTF_ID ||
+ 			   (reg2btf_ids[base_type(reg->type)] && !type_flag(reg->type)))) {
+ 			const struct btf_type *reg_ref_t;
+@@ -7353,10 +7411,8 @@ static int btf_populate_kfunc_set(struct btf *btf, enum btf_kfunc_hook hook,
+ 	u32 set_cnt;
+ 	int ret;
+ 
+-	if (hook >= BTF_KFUNC_HOOK_MAX) {
+-		ret = -EINVAL;
+-		goto end;
+-	}
++	if (hook >= BTF_KFUNC_HOOK_MAX)
++		return -EINVAL;
+ 
+ 	if (!add_set->cnt)
+ 		return 0;
+@@ -7463,6 +7519,8 @@ static int bpf_prog_type_to_kfunc_hook(enum bpf_prog_type prog_type)
+ 	case BPF_PROG_TYPE_STRUCT_OPS:
+ 		return BTF_KFUNC_HOOK_STRUCT_OPS;
+ 	case BPF_PROG_TYPE_TRACING:
++	case BPF_PROG_TYPE_RAW_TRACEPOINT:
++	case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE:
+ 	case BPF_PROG_TYPE_LSM:
+ 		return BTF_KFUNC_HOOK_TRACING;
+ 	case BPF_PROG_TYPE_SYSCALL:
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 90ce97f34f4b..ceb264d504b5 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1058,6 +1058,19 @@ static int map_check_btf(struct bpf_map *map, const struct btf *btf,
+ 	}
+ 
+ 	map->kptr_off_tab = btf_parse_kptrs(btf, value_type);
++	if (IS_ERR(map->kptr_off_tab)) {
++		/*
++		 * Losing the kptr table silently degrades every kptr load
++		 * from this map into a plain scalar load, which used to be
++		 * very hard to debug. Complain, but not for value types that
++		 * cannot hold a kptr in the first place.
++		 */
++		if (BTF_INFO_KIND(value_type->info) == BTF_KIND_STRUCT ||
++		    BTF_INFO_KIND(value_type->info) == BTF_KIND_DATASEC)
++			pr_warn("map '%s': failed to parse kptrs: %ld\n",
++				map->name, PTR_ERR(map->kptr_off_tab));
++		map->kptr_off_tab = NULL;
++	}
+ 	if (map_value_has_kptrs(map)) {
+ 		if (!bpf_capable()) {
+ 			ret = -EPERM;
+@@ -4562,6 +4575,11 @@ static int link_create(union bpf_attr *attr, bpfptr_t uattr)
+ 	if (CHECK_ATTR(BPF_LINK_CREATE))
+ 		return -EINVAL;
+ 
++	if (attr->link_create.attach_type == 44) {
++		extern int bpf_struct_ops_link_create(const union bpf_attr *attr);
++		return bpf_struct_ops_link_create(attr);
++	}
++
+ 	prog = bpf_prog_get(attr->link_create.prog_fd);
+ 	if (IS_ERR(prog))
+ 		return PTR_ERR(prog);
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index e5599ccdc638..68943869881d 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -10637,6 +10637,8 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 			verbose(env, "missing btf func_info\n");
+ 			return -EINVAL;
+ 		}
++		if (aux->func_info_aux[subprogno].linkage == BTF_FUNC_GLOBAL)
++			aux->func_info_aux[subprogno].linkage = BTF_FUNC_STATIC;
+ 		if (aux->func_info_aux[subprogno].linkage != BTF_FUNC_STATIC) {
+ 			verbose(env, "callback function not static\n");
+ 			return -EINVAL;
+@@ -11336,6 +11338,23 @@ static int check_btf_func(struct bpf_verifier_env *env,
+ 		ret_type = btf_type_skip_modifiers(btf, func_proto->type, NULL);
+ 		scalar_return =
+ 			btf_type_is_small_int(ret_type) || btf_is_any_enum(ret_type);
++		if (i && info_aux[i].linkage == BTF_FUNC_GLOBAL &&
++		    prog->type != BPF_PROG_TYPE_EXT) {
++			const struct btf_param *args =
++				(const struct btf_param *)(func_proto + 1);
++			u32 j, nargs = btf_type_vlen(func_proto);
++			bool can_be_global = btf_type_is_int(ret_type) ||
++					     btf_is_any_enum(ret_type);
++
++			for (j = 0; can_be_global && j < nargs; j++) {
++				const struct btf_type *at =
++					btf_type_skip_modifiers(btf, args[j].type, NULL);
++				if (!btf_type_is_int(at) && !btf_is_any_enum(at))
++					can_be_global = false;
++			}
++			if (!can_be_global)
++				info_aux[i].linkage = BTF_FUNC_STATIC;
++		}
+ 		if (i && !scalar_return && env->subprog_info[i].has_ld_abs) {
+ 			verbose(env, "LD_ABS is only allowed in functions that return 'int'.\n");
+ 			goto err_free;
+@@ -12837,8 +12856,8 @@ static int check_pseudo_btf_id(struct bpf_verifier_env *env,
+ 		goto err_put;
+ 	}
+ 
+-	if (!btf_type_is_var(t)) {
+-		verbose(env, "pseudo btf_id %d in ldimm64 isn't KIND_VAR.\n", id);
++	if (!btf_type_is_var(t) && !btf_type_is_func(t)) {
++		verbose(env, "pseudo btf_id %d in ldimm64 isn't KIND_VAR or KIND_FUNC.\n", id);
+ 		err = -EINVAL;
+ 		goto err_put;
+ 	}
+@@ -12866,9 +12885,13 @@ static int check_pseudo_btf_id(struct bpf_verifier_env *env,
+ 	insn[0].imm = (u32)addr;
+ 	insn[1].imm = addr >> 32;
+ 
+-	type = t->type;
+-	t = btf_type_skip_modifiers(btf, type, NULL);
+-	if (percpu) {
++	if (btf_type_is_func(t)) {
++		aux->btf_var.reg_type = PTR_TO_MEM | MEM_RDONLY;
++		aux->btf_var.mem_size = 0;
++	} else {
++		type = t->type;
++		t = btf_type_skip_modifiers(btf, type, NULL);
++		if (percpu) {
+ 		aux->btf_var.reg_type = PTR_TO_BTF_ID | MEM_PERCPU;
+ 		aux->btf_var.btf = btf;
+ 		aux->btf_var.btf_id = type;
+@@ -12888,10 +12911,11 @@ static int check_pseudo_btf_id(struct bpf_verifier_env *env,
+ 		}
+ 		aux->btf_var.reg_type = PTR_TO_MEM | MEM_RDONLY;
+ 		aux->btf_var.mem_size = tsize;
+-	} else {
+-		aux->btf_var.reg_type = PTR_TO_BTF_ID;
+-		aux->btf_var.btf = btf;
+-		aux->btf_var.btf_id = type;
++		} else {
++			aux->btf_var.reg_type = PTR_TO_BTF_ID;
++			aux->btf_var.btf = btf;
++			aux->btf_var.btf_id = type;
++		}
+ 	}
+ 
+ 	/* check whether we recorded this BTF (and maybe module) already */
+@@ -15384,7 +15408,8 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
+ 	}
+ 
+ 	if (prog->aux->sleepable && prog->type != BPF_PROG_TYPE_TRACING &&
+-	    prog->type != BPF_PROG_TYPE_LSM && prog->type != BPF_PROG_TYPE_KPROBE) {
++	    prog->type != BPF_PROG_TYPE_LSM && prog->type != BPF_PROG_TYPE_KPROBE &&
++	    prog->type != BPF_PROG_TYPE_STRUCT_OPS) {
+ 		verbose(env, "Only fentry/fexit/fmod_ret, lsm, and kprobe/uprobe programs can be sleepable\n");
+ 		return -EINVAL;
+ 	}
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index ff1738cecd4c..7877c2905039 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -33,3 +33,5 @@ obj-y += fair.o
+ obj-y += build_policy.o
+ obj-y += build_utility.o
+ obj-$(CONFIG_ANDROID_VENDOR_HOOKS) += vendor_hooks.o
++
++obj-$(CONFIG_SCHED_CLASS_EXT) += ext.o
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+new file mode 100644
+index 000000000000..368a5f9efb38
+--- /dev/null
++++ b/kernel/sched/ext.c
+@@ -0,0 +1,1734 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * KMI-clean sched_ext (BPF extensible scheduler) implementation for Linux 6.1 GKI
++ *
++ * Preserves exact sizeof(struct task_struct), sizeof(struct rq), and Module.symvers
++ * KMI ABI hashes by storing per-task state in task_struct::android_oem_data1[0..5]
++ * and per-CPU dispatch queues in per-CPU storage.
++ */
++
++#include <linux/sched/cputime.h>
++#include "sched.h"
++#include <linux/sched/ext.h>
++#include <linux/bpf.h>
++#include <linux/bpf_verifier.h>
++#include <linux/btf.h>
++#include <linux/btf_ids.h>
++#include <linux/filter.h>
++#include <linux/kobject.h>
++#include <linux/sysfs.h>
++#include <linux/cpumask.h>
++#include <linux/cgroup.h>
++#include <linux/percpu.h>
++#include <linux/spinlock.h>
++#include <linux/rcupdate.h>
++
++#define SCX_OEM_MAGIC		0x5c70U
++#define SCX_MAX_USER_DSQS	64
++
++#define SCX_TF_QUEUED		(1U << 0)
++#define SCX_TF_DIRECT_LOCAL	(1U << 1)
++#define SCX_TF_INITED		(1U << 2)
++
++/*
++ * Mapped onto task_struct::android_oem_data1[0..5] (48 bytes).
++ * Notice android_oem_data1[0] is dsq_vtime and android_oem_data1[1] is slice.
++ */
++struct scx_task_oem {
++	u64			dsq_vtime;	/* [0] */
++	u64			slice;		/* [1] */
++	u16			dsq_slot;	/* [2] 0=none, 1=local, 2..65=user_dsqs[0..63] */
++	s16			selected_cpu;	/* [2] target cpu from select_cpu */
++	s16			queued_cpu;	/* [2] cpu whose scx_cpu_rq holds @node */
++	u16			magic;		/* [2] SCX_OEM_MAGIC */
++	u32			weight;		/* [3] */
++	u32			flags;		/* [3] SCX_TF_* */
++	struct list_head	node;		/* [4..5] */
++};
++
++struct scx_cpu_rq {
++	raw_spinlock_t		lock;
++	struct list_head	local_dsq;
++	struct list_head	user_dsqs[SCX_MAX_USER_DSQS];
++	u32			nr_queued;
++	u32			local_nr_queued;
++	u32			user_nr_queued[SCX_MAX_USER_DSQS];
++	u32			cpuperf_target;
++};
++
++static DEFINE_PER_CPU(struct scx_cpu_rq, scx_cpu_rqs);
++static DEFINE_PER_CPU(int, scx_in_select_cpu);
++static DEFINE_PER_CPU(int, scx_dispatch_cpu);
++
++static cpumask_t scx_idle_cpumask_storage;
++static DEFINE_MUTEX(scx_ops_mutex);
++static DEFINE_RAW_SPINLOCK(scx_dsq_id_lock);
++static u64 scx_user_dsq_ids[SCX_MAX_USER_DSQS];
++static bool scx_user_dsq_used[SCX_MAX_USER_DSQS];
++
++static DEFINE_STATIC_KEY_FALSE(scx_ops_enabled_key);
++static struct sched_ext_ops scx_active_ops;
++static struct scx_exit_info scx_active_exit_info;
++static char scx_exit_reason_buf[64] = "unregistered";
++static char scx_exit_msg_buf[256];
++static char scx_exit_dump_buf[256];
++static atomic64_t scx_enable_seq = ATOMIC64_INIT(0);
++static atomic64_t scx_hotplug_seq_cnt = ATOMIC64_INIT(0);
++
++/* Ensure BTF types for all scx enums and structs are emitted into vmlinux BTF */
++struct __scx_btf_type_holder {
++	enum scx_public_consts			e1;
++	enum scx_consts				e2;
++	enum scx_dsq_id_flags			e3;
++	enum scx_ent_flags			e4;
++	enum scx_ent_dsq_flags			e5;
++	enum scx_rq_flags			e6;
++	enum scx_kick_flags			e7;
++	enum scx_enq_flags			e8;
++	enum scx_deq_flags			e9;
++	enum scx_exit_kind			e10;
++	enum scx_cpu_preempt_reason		e11;
++	struct scx_exit_info			s1;
++	struct scx_init_task_args		s2;
++	struct scx_exit_task_args		s3;
++	struct scx_dump_ctx			s4;
++	struct scx_bpf_dsq_insert_vtime_args	s5;
++};
++
++static __always_inline u16 scx_task_magic(const struct task_struct *p)
++{
++	unsigned long v = (unsigned long)p;
++	u16 h = (u16)((v >> 6) ^ (v >> 22) ^ (v >> 38) ^ SCX_OEM_MAGIC);
++
++	return h ? h : 1;
++}
++
++static __always_inline struct scx_task_oem *scx_task_data(struct task_struct *p)
++{
++	struct scx_task_oem *oem;
++	u16 magic = scx_task_magic(p);
++
++	BUILD_BUG_ON(sizeof(struct scx_task_oem) > sizeof(p->android_oem_data1));
++	oem = (struct scx_task_oem *)&p->android_oem_data1[0];
++	if (unlikely(oem->magic != magic)) {
++		oem->dsq_vtime = 0;
++		oem->slice = SCX_SLICE_DFL;
++		oem->dsq_slot = 0;
++		oem->selected_cpu = -1;
++		oem->queued_cpu = -1;
++		oem->weight = p->prio < 120 ? 200 : 100;
++		oem->flags = 0;
++		INIT_LIST_HEAD(&oem->node);
++		smp_wmb();
++		oem->magic = magic;
++	}
++	return oem;
++}
++
++void scx_task_fork(struct task_struct *p)
++{
++	struct scx_task_oem *oem = (struct scx_task_oem *)&p->android_oem_data1[0];
++
++	oem->dsq_vtime = 0;
++	oem->slice = SCX_SLICE_DFL;
++	oem->dsq_slot = 0;
++	oem->selected_cpu = -1;
++	oem->queued_cpu = -1;
++	oem->weight = p->prio < 120 ? 200 : 100;
++	oem->flags = 0;
++	INIT_LIST_HEAD(&oem->node);
++	smp_wmb();
++	oem->magic = scx_task_magic(p);
++}
++
++bool scx_enabled(void)
++{
++	return static_branch_unlikely(&scx_ops_enabled_key);
++}
++
++static int scx_find_user_dsq_slot(u64 dsq_id)
++{
++	int i;
++
++	for (i = 0; i < SCX_MAX_USER_DSQS; i++) {
++		if (READ_ONCE(scx_user_dsq_used[i]) &&
++		    READ_ONCE(scx_user_dsq_ids[i]) == dsq_id)
++			return i;
++	}
++	return -ENOENT;
++}
++
++static void scx_task_unlink(struct task_struct *p)
++{
++	struct scx_task_oem *oem = scx_task_data(p);
++	int qcpu = READ_ONCE(oem->queued_cpu);
++	struct scx_cpu_rq *crq;
++	unsigned long flags;
++
++	if (!(READ_ONCE(oem->flags) & SCX_TF_QUEUED) ||
++	    qcpu < 0 || qcpu >= nr_cpu_ids) {
++		oem->dsq_slot = 0;
++		oem->queued_cpu = -1;
++		oem->flags &= ~SCX_TF_QUEUED;
++		INIT_LIST_HEAD(&oem->node);
++		return;
++	}
++
++	crq = &per_cpu(scx_cpu_rqs, qcpu);
++	raw_spin_lock_irqsave(&crq->lock, flags);
++	if ((oem->flags & SCX_TF_QUEUED) && oem->queued_cpu == qcpu &&
++	    oem->node.next && oem->node.prev && !list_empty(&oem->node)) {
++		list_del_init(&oem->node);
++		if (crq->nr_queued > 0)
++			crq->nr_queued--;
++		if (oem->dsq_slot == 1) {
++			if (crq->local_nr_queued > 0)
++				crq->local_nr_queued--;
++		} else if (oem->dsq_slot >= 2 &&
++			   oem->dsq_slot < SCX_MAX_USER_DSQS + 2) {
++			u16 idx = oem->dsq_slot - 2;
++			if (crq->user_nr_queued[idx] > 0)
++				crq->user_nr_queued[idx]--;
++		}
++	} else {
++		INIT_LIST_HEAD(&oem->node);
++	}
++	oem->dsq_slot = 0;
++	oem->queued_cpu = -1;
++	oem->flags &= ~SCX_TF_QUEUED;
++	raw_spin_unlock_irqrestore(&crq->lock, flags);
++}
++
++void scx_task_picked_fallback(struct task_struct *p)
++{
++	if (p && scx_enabled())
++		scx_task_unlink(p);
++}
++
++static void scx_task_insert_on_cpu(struct task_struct *p, int cpu, u16 slot,
++				   u64 slice, u64 vtime, bool use_vtime,
++				   u64 enq_flags)
++{
++	struct scx_task_oem *oem = scx_task_data(p);
++	struct scx_cpu_rq *crq;
++	struct list_head *head;
++	unsigned long flags;
++
++	if (cpu < 0 || cpu >= nr_cpu_ids)
++		cpu = task_cpu(p);
++
++	scx_task_unlink(p);
++
++	if (slice > 0)
++		oem->slice = slice;
++	else if (oem->slice == 0)
++		oem->slice = SCX_SLICE_DFL;
++
++	if (use_vtime)
++		oem->dsq_vtime = vtime;
++
++	crq = &per_cpu(scx_cpu_rqs, cpu);
++	raw_spin_lock_irqsave(&crq->lock, flags);
++	INIT_LIST_HEAD(&oem->node);
++
++	if (slot <= 1 || slot > SCX_MAX_USER_DSQS + 1) {
++		head = &crq->local_dsq;
++		slot = 1;
++		if (enq_flags & (SCX_ENQ_HEAD | SCX_ENQ_PREEMPT))
++			list_add(&oem->node, head);
++		else
++			list_add_tail(&oem->node, head);
++		crq->local_nr_queued++;
++	} else {
++		struct scx_task_oem *pos;
++		bool inserted = false;
++
++		head = &crq->user_dsqs[slot - 2];
++		if (use_vtime) {
++			list_for_each_entry(pos, head, node) {
++				if ((s64)(vtime - pos->dsq_vtime) < 0) {
++					list_add_tail(&oem->node, &pos->node);
++					inserted = true;
++					break;
++				}
++			}
++		}
++		if (!inserted) {
++			if (enq_flags & SCX_ENQ_HEAD)
++				list_add(&oem->node, head);
++			else
++				list_add_tail(&oem->node, head);
++		}
++		crq->user_nr_queued[slot - 2]++;
++	}
++
++	oem->dsq_slot = slot;
++	oem->queued_cpu = cpu;
++	oem->flags |= SCX_TF_QUEUED;
++	crq->nr_queued++;
++	raw_spin_unlock_irqrestore(&crq->lock, flags);
++}
++
++/* ==========================================================================
++ * BPF Verifier & kfuncs for sched_ext
++ * ========================================================================== */
++
++__diag_push();
++__diag_ignore_all("-Wmissing-prototypes",
++		  "Global kfuncs whose prototypes are emitted into vmlinux BTF");
++
++__used noinline s32 scx_bpf_create_dsq(u64 dsq_id, s32 node)
++{
++	unsigned long flags;
++	int i, free_slot = -1;
++
++	if (dsq_id & SCX_DSQ_FLAG_BUILTIN)
++		return -EINVAL;
++
++	raw_spin_lock_irqsave(&scx_dsq_id_lock, flags);
++	for (i = 0; i < SCX_MAX_USER_DSQS; i++) {
++		if (scx_user_dsq_used[i] && scx_user_dsq_ids[i] == dsq_id) {
++			raw_spin_unlock_irqrestore(&scx_dsq_id_lock, flags);
++			return 0;
++		}
++		if (!scx_user_dsq_used[i] && free_slot < 0)
++			free_slot = i;
++	}
++	if (free_slot >= 0) {
++		scx_user_dsq_ids[free_slot] = dsq_id;
++		scx_user_dsq_used[free_slot] = true;
++	}
++	raw_spin_unlock_irqrestore(&scx_dsq_id_lock, flags);
++
++	return free_slot >= 0 ? 0 : -ENOSPC;
++}
++
++__used noinline void scx_bpf_destroy_dsq(u64 dsq_id)
++{
++	unsigned long flags;
++	int i;
++
++	raw_spin_lock_irqsave(&scx_dsq_id_lock, flags);
++	for (i = 0; i < SCX_MAX_USER_DSQS; i++) {
++		if (scx_user_dsq_used[i] && scx_user_dsq_ids[i] == dsq_id) {
++			scx_user_dsq_used[i] = false;
++			scx_user_dsq_ids[i] = 0;
++		}
++	}
++	raw_spin_unlock_irqrestore(&scx_dsq_id_lock, flags);
++}
++
++static bool __scx_do_insert(struct task_struct *p, u64 dsq_id, u64 slice,
++			    u64 vtime, bool use_vtime, u64 enq_flags)
++{
++	struct scx_task_oem *oem;
++	int cpu, slot = 1;
++
++	if (!p)
++		return false;
++
++	oem = scx_task_data(p);
++	if (this_cpu_read(scx_in_select_cpu)) {
++		if ((dsq_id & SCX_DSQ_FLAG_BUILTIN) == 0) {
++			int idx = scx_find_user_dsq_slot(dsq_id);
++			if (idx >= 0) {
++				oem->slice = slice ? slice : SCX_SLICE_DFL;
++				if (use_vtime)
++					oem->dsq_vtime = vtime;
++				oem->dsq_slot = idx + 2;
++				oem->flags |= SCX_TF_DIRECT_LOCAL;
++				return true;
++			}
++		}
++		oem->slice = slice ? slice : SCX_SLICE_DFL;
++		if (use_vtime)
++			oem->dsq_vtime = vtime;
++		oem->dsq_slot = 1;
++		oem->flags |= SCX_TF_DIRECT_LOCAL;
++		if ((dsq_id & SCX_DSQ_LOCAL_ON) == SCX_DSQ_LOCAL_ON) {
++			s32 tcpu = (s32)(dsq_id & SCX_DSQ_LOCAL_CPU_MASK);
++			if (tcpu >= 0 && tcpu < nr_cpu_ids)
++				oem->selected_cpu = tcpu;
++		}
++		return true;
++	}
++
++	cpu = task_cpu(p);
++	if ((dsq_id & SCX_DSQ_FLAG_BUILTIN) == 0) {
++		int idx = scx_find_user_dsq_slot(dsq_id);
++		if (idx >= 0)
++			slot = idx + 2;
++	} else if ((dsq_id & SCX_DSQ_LOCAL_ON) == SCX_DSQ_LOCAL_ON) {
++		s32 tcpu = (s32)(dsq_id & SCX_DSQ_LOCAL_CPU_MASK);
++		if (tcpu >= 0 && tcpu < nr_cpu_ids &&
++		    cpumask_test_cpu(tcpu, p->cpus_ptr))
++			oem->selected_cpu = tcpu;
++		slot = 1;
++	}
++
++	scx_task_insert_on_cpu(p, cpu, slot, slice, vtime, use_vtime, enq_flags);
++	return true;
++}
++
++__used noinline bool scx_bpf_dsq_insert___v2(struct task_struct *p,
++						      u64 dsq_id, u64 slice,
++						      u64 enq_flags)
++{
++	return __scx_do_insert(p, dsq_id, slice, 0, false, enq_flags);
++}
++
++__used noinline void scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id,
++					     u64 slice, u64 enq_flags)
++{
++	__scx_do_insert(p, dsq_id, slice, 0, false, enq_flags);
++}
++
++__used noinline void scx_bpf_dispatch(struct task_struct *p, u64 dsq_id,
++					       u64 slice, u64 enq_flags)
++{
++	__scx_do_insert(p, dsq_id, slice, 0, false, enq_flags);
++}
++
++__used noinline bool __scx_bpf_dsq_insert_vtime(struct task_struct *p,
++						struct scx_bpf_dsq_insert_vtime_args *args)
++{
++	if (!args)
++		return false;
++	return __scx_do_insert(p, args->dsq_id, args->slice, args->vtime,
++			       true, args->enq_flags);
++}
++
++__used noinline void scx_bpf_dsq_insert_vtime(struct task_struct *p,
++						       u64 dsq_id, u64 slice,
++						       u64 vtime, u64 enq_flags)
++{
++	__scx_do_insert(p, dsq_id, slice, vtime, true, enq_flags);
++}
++
++__used noinline void scx_bpf_dispatch_vtime(struct task_struct *p,
++						     u64 dsq_id, u64 slice,
++						     u64 vtime, u64 enq_flags)
++{
++	__scx_do_insert(p, dsq_id, slice, vtime, true, enq_flags);
++}
++
++static bool __scx_move_to_local(u64 dsq_id)
++{
++	int cpu = this_cpu_read(scx_dispatch_cpu);
++	struct scx_cpu_rq *crq;
++	struct scx_task_oem *oem;
++	unsigned long flags;
++	int idx;
++	bool moved = false;
++
++	if (cpu < 0 || cpu >= nr_cpu_ids)
++		cpu = raw_smp_processor_id();
++
++	if (dsq_id == SCX_DSQ_GLOBAL || dsq_id == SCX_DSQ_LOCAL)
++		return false;
++
++	idx = scx_find_user_dsq_slot(dsq_id);
++	if (idx < 0)
++		return false;
++
++	crq = &per_cpu(scx_cpu_rqs, cpu);
++	raw_spin_lock_irqsave(&crq->lock, flags);
++	if (!list_empty(&crq->user_dsqs[idx])) {
++		oem = list_first_entry(&crq->user_dsqs[idx],
++				       struct scx_task_oem, node);
++		if (idx == 0)
++			list_move(&oem->node, &crq->local_dsq);
++		else
++			list_move_tail(&oem->node, &crq->local_dsq);
++		if (crq->user_nr_queued[idx] > 0)
++			crq->user_nr_queued[idx]--;
++		crq->local_nr_queued++;
++		oem->dsq_slot = 1;
++		moved = true;
++	}
++	raw_spin_unlock_irqrestore(&crq->lock, flags);
++
++	return moved;
++}
++
++__used noinline bool scx_bpf_dsq_move_to_local(u64 dsq_id, u64 enq_flags)
++{
++	return __scx_move_to_local(dsq_id);
++}
++
++__used noinline bool scx_bpf_dsq_move_to_local___v2(u64 dsq_id, u64 enq_flags)
++{
++	return __scx_move_to_local(dsq_id);
++}
++
++__used noinline bool scx_bpf_consume(u64 dsq_id)
++{
++	return __scx_move_to_local(dsq_id);
++}
++
++__used noinline void scx_bpf_kick_cpu(s32 cpu, u64 flags)
++{
++	struct rq *rq;
++
++	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu))
++		return;
++
++	rq = cpu_rq(cpu);
++	if (flags & SCX_KICK_PREEMPT) {
++		struct task_struct *curr = READ_ONCE(rq->curr);
++		if (curr && curr->sched_class == &fair_sched_class) {
++			struct scx_task_oem *oem = scx_task_data(curr);
++			oem->slice = 0;
++		}
++	}
++	if (cpu == raw_smp_processor_id()) {
++		set_tsk_need_resched(current);
++		set_preempt_need_resched();
++	} else {
++		smp_send_reschedule(cpu);
++	}
++}
++
++__used noinline s32 scx_bpf_task_cpu(const struct task_struct *p)
++{
++	if (!p)
++		return 0;
++	return task_cpu(p);
++}
++
++__used noinline bool scx_bpf_task_running(const struct task_struct *p)
++{
++	if (!p)
++		return false;
++	return task_on_cpu(task_rq(p), (struct task_struct *)p);
++}
++
++__used noinline bool scx_bpf_task_set_slice(struct task_struct *p, u64 slice)
++{
++	struct scx_task_oem *oem;
++
++	if (!p)
++		return false;
++	oem = scx_task_data(p);
++	oem->slice = slice;
++	return true;
++}
++
++__used noinline bool scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime)
++{
++	struct scx_task_oem *oem;
++
++	if (!p)
++		return false;
++	oem = scx_task_data(p);
++	oem->dsq_vtime = vtime;
++	return true;
++}
++
++__used noinline void scx_bpf_cpuperf_set(s32 cpu, u32 perf)
++{
++	if (cpu < 0 || cpu >= nr_cpu_ids)
++		return;
++	per_cpu(scx_cpu_rqs.cpuperf_target, cpu) = perf;
++}
++
++__used noinline u32 scx_bpf_cpuperf_cap(s32 cpu)
++{
++	if (cpu < 0 || cpu >= nr_cpu_ids)
++		return 1024;
++	return arch_scale_cpu_capacity(cpu);
++}
++
++__used noinline u32 scx_bpf_cpuperf_cur(s32 cpu)
++{
++	if (cpu < 0 || cpu >= nr_cpu_ids)
++		return 1024;
++	return arch_scale_freq_capacity(cpu);
++}
++
++__used noinline const struct cpumask *scx_bpf_get_idle_cpumask(void)
++{
++	return &scx_idle_cpumask_storage;
++}
++
++__used noinline const struct cpumask *scx_bpf_get_idle_smtmask(void)
++{
++	return &scx_idle_cpumask_storage;
++}
++
++__used noinline void scx_bpf_put_cpumask(const struct cpumask *cpumask)
++{
++}
++
++__used noinline void scx_bpf_put_idle_cpumask(const struct cpumask *cpumask)
++{
++}
++
++__used noinline bool scx_bpf_test_and_clear_cpu_idle(s32 cpu)
++{
++	if (cpu < 0 || cpu >= nr_cpu_ids)
++		return false;
++	return cpumask_test_and_clear_cpu(cpu, &scx_idle_cpumask_storage);
++}
++
++__used noinline s32 scx_bpf_pick_idle_cpu(const cpumask_t *cpus_allowed, u64 flags)
++{
++	int cpu;
++
++	if (!cpus_allowed)
++		return -EBUSY;
++
++	for_each_cpu_and(cpu, &scx_idle_cpumask_storage, cpus_allowed) {
++		if (cpumask_test_and_clear_cpu(cpu, &scx_idle_cpumask_storage))
++			return cpu;
++	}
++	return -EBUSY;
++}
++
++__used noinline s32 scx_bpf_pick_any_cpu(const cpumask_t *cpus_allowed, u64 flags)
++{
++	s32 cpu;
++
++	if (!cpus_allowed)
++		return -EBUSY;
++
++	cpu = scx_bpf_pick_idle_cpu(cpus_allowed, flags);
++	if (cpu >= 0)
++		return cpu;
++
++	cpu = cpumask_any_and_distribute(cpus_allowed, cpu_online_mask);
++	if (cpu < nr_cpu_ids)
++		return cpu;
++	return -EBUSY;
++}
++
++__used noinline u32 scx_bpf_reenqueue_local(void)
++{
++	int cpu = raw_smp_processor_id();
++	struct scx_cpu_rq *crq = &per_cpu(scx_cpu_rqs, cpu);
++	struct scx_task_oem *oem, *tmp;
++	LIST_HEAD(tasks);
++	unsigned long flags;
++	u32 cnt = 0;
++
++	raw_spin_lock_irqsave(&crq->lock, flags);
++	list_for_each_entry_safe(oem, tmp, &crq->local_dsq, node) {
++		list_move_tail(&oem->node, &tasks);
++		oem->dsq_slot = 0;
++		oem->queued_cpu = -1;
++		oem->flags &= ~SCX_TF_QUEUED;
++		if (crq->nr_queued > 0)
++			crq->nr_queued--;
++		if (crq->local_nr_queued > 0)
++			crq->local_nr_queued--;
++		cnt++;
++	}
++	raw_spin_unlock_irqrestore(&crq->lock, flags);
++
++	list_for_each_entry_safe(oem, tmp, &tasks, node) {
++		struct task_struct *p = container_of((u64 *)oem,
++						     struct task_struct,
++						     android_oem_data1[0]);
++		list_del_init(&oem->node);
++		if (scx_active_ops.enqueue) {
++			rcu_read_lock();
++			scx_active_ops.enqueue(p, SCX_ENQ_REENQ);
++			rcu_read_unlock();
++		}
++		if (!(oem->flags & SCX_TF_QUEUED))
++			scx_task_insert_on_cpu(p, cpu, 1, oem->slice,
++					       oem->dsq_vtime, false, 0);
++	}
++	return cnt;
++}
++
++__used noinline u32 scx_bpf_nr_node_ids(void)
++{
++	return nr_node_ids;
++}
++
++__used noinline int scx_bpf_cpu_node(s32 cpu)
++{
++	if (cpu < 0 || cpu >= nr_cpu_ids)
++		return 0;
++	return cpu_to_node(cpu);
++}
++
++__used noinline struct rq *scx_bpf_cpu_rq(s32 cpu)
++{
++	if (cpu < 0 || cpu >= nr_cpu_ids)
++		return NULL;
++	return cpu_rq(cpu);
++}
++
++__used noinline struct rq *scx_bpf_locked_rq(void)
++{
++	return this_rq();
++}
++
++__used noinline struct task_struct *bpf_task_from_pid(s32 pid)
++{
++	struct task_struct *p;
++
++	rcu_read_lock();
++	p = find_task_by_vpid(pid);
++	if (p)
++		get_task_struct(p);
++	rcu_read_unlock();
++
++	return p;
++}
++
++__used noinline struct task_struct *bpf_task_acquire(struct task_struct *p)
++{
++	if (p)
++		get_task_struct(p);
++	return p;
++}
++
++__used noinline void bpf_task_release(struct task_struct *p)
++{
++	if (p)
++		put_task_struct(p);
++}
++
++__used noinline s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
++					   u64 wake_flags, bool *is_idle)
++{
++	s32 cpu;
++
++	if (!p)
++		return prev_cpu;
++
++	if (prev_cpu >= 0 && prev_cpu < nr_cpu_ids &&
++	    cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
++	    cpumask_test_and_clear_cpu(prev_cpu, &scx_idle_cpumask_storage)) {
++		if (is_idle)
++			*is_idle = true;
++		return prev_cpu;
++	}
++
++	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
++	if (cpu >= 0) {
++		if (is_idle)
++			*is_idle = true;
++		return cpu;
++	}
++
++	if (is_idle)
++		*is_idle = false;
++	return prev_cpu;
++}
++
++__used noinline bool bpf_cpumask_test_cpu(u32 cpu, const struct cpumask *cpumask)
++{
++	if (!cpumask || cpu >= nr_cpu_ids)
++		return false;
++	return cpumask_test_cpu(cpu, cpumask);
++}
++
++__used noinline u32 scx_bpf_nr_cpu_ids(void)
++{
++	return nr_cpu_ids;
++}
++
++__used noinline u64 scx_bpf_now(void)
++{
++	return ktime_get_ns();
++}
++
++__used noinline s32 scx_bpf_dsq_nr_queued(u64 dsq_id)
++{
++	int cpu, idx;
++	s32 tot = 0;
++
++	if (dsq_id == SCX_DSQ_LOCAL) {
++		cpu = raw_smp_processor_id();
++		return READ_ONCE(per_cpu(scx_cpu_rqs.local_nr_queued, cpu));
++	}
++	if ((dsq_id & SCX_DSQ_LOCAL_ON) == SCX_DSQ_LOCAL_ON) {
++		cpu = (int)(dsq_id & SCX_DSQ_LOCAL_CPU_MASK);
++		if (cpu < 0 || cpu >= nr_cpu_ids)
++			return 0;
++		return READ_ONCE(per_cpu(scx_cpu_rqs.local_nr_queued, cpu));
++	}
++	idx = scx_find_user_dsq_slot(dsq_id);
++	if (idx < 0)
++		return 0;
++	for_each_online_cpu(cpu) {
++		struct scx_cpu_rq *crq = &per_cpu(scx_cpu_rqs, cpu);
++		tot += READ_ONCE(crq->user_nr_queued[idx]);
++	}
++	return tot;
++}
++
++__used noinline u32 scx_bpf_dispatch_nr_slots(void)
++{
++	return SCX_DSP_DFL_MAX_BATCH;
++}
++
++__used noinline void scx_bpf_dispatch_cancel(void)
++{
++}
++
++__used noinline void scx_bpf_exit_bstr(s64 exit_code, char *fmt,
++				       unsigned long long *data, u32 data__sz)
++{
++	scx_active_exit_info.kind = SCX_EXIT_UNREG_BPF;
++	scx_active_exit_info.exit_code = exit_code;
++}
++
++__used noinline void scx_bpf_error_bstr(char *fmt, unsigned long long *data,
++					u32 data__sz)
++{
++	scx_active_exit_info.kind = SCX_EXIT_ERROR_BPF;
++}
++
++__used noinline void scx_bpf_dump_bstr(char *fmt, unsigned long long *data,
++				       u32 data__sz)
++{
++}
++
++
++struct bpf_cpumask {
++	cpumask_t cpumask;
++	refcount_t usage;
++};
++
++__used noinline const struct cpumask *scx_bpf_get_online_cpumask(void)
++{
++	return cpu_online_mask;
++}
++
++__used noinline const struct cpumask *scx_bpf_get_possible_cpumask(void)
++{
++	return cpu_possible_mask;
++}
++
++__used noinline struct task_struct *scx_bpf_cpu_curr(s32 cpu)
++{
++	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu))
++		return NULL;
++	return READ_ONCE(cpu_rq(cpu)->curr);
++}
++
++__used noinline struct task_struct *scx_bpf_dsq_peek(u64 dsq_id)
++{
++	int cpu = raw_smp_processor_id();
++	struct scx_cpu_rq *crq = &per_cpu(scx_cpu_rqs, cpu);
++	struct task_struct *p = NULL;
++	struct scx_task_oem *oem;
++	unsigned long flags;
++	int idx;
++
++	idx = scx_find_user_dsq_slot(dsq_id);
++	if (idx < 0)
++		return NULL;
++
++	raw_spin_lock_irqsave(&crq->lock, flags);
++	if (!list_empty(&crq->user_dsqs[idx])) {
++		oem = list_first_entry(&crq->user_dsqs[idx],
++				       struct scx_task_oem, node);
++		p = container_of((u64 *)oem, struct task_struct,
++				 android_oem_data1[0]);
++	}
++	raw_spin_unlock_irqrestore(&crq->lock, flags);
++	return p;
++}
++
++__used noinline void bpf_rcu_read_lock(void)
++{
++	rcu_read_lock();
++}
++
++__used noinline void bpf_rcu_read_unlock(void)
++{
++	rcu_read_unlock();
++}
++
++__used noinline struct bpf_cpumask *bpf_cpumask_create(void)
++{
++	struct bpf_cpumask *cpumask;
++
++	cpumask = kzalloc(sizeof(*cpumask), GFP_ATOMIC);
++	if (!cpumask)
++		return NULL;
++	refcount_set(&cpumask->usage, 1);
++	return cpumask;
++}
++
++__used noinline void bpf_cpumask_release(struct bpf_cpumask *cpumask)
++{
++	if (cpumask && refcount_dec_and_test(&cpumask->usage))
++		kfree(cpumask);
++}
++
++__used noinline struct bpf_cpumask *bpf_cpumask_acquire(struct bpf_cpumask *cpumask)
++{
++	if (cpumask)
++		refcount_inc(&cpumask->usage);
++	return cpumask;
++}
++
++__used noinline void bpf_cpumask_clear(struct bpf_cpumask *cpumask)
++{
++	if (cpumask)
++		cpumask_clear(&cpumask->cpumask);
++}
++
++__used noinline void bpf_cpumask_set_cpu(u32 cpu, struct bpf_cpumask *cpumask)
++{
++	if (cpumask && cpu < nr_cpu_ids)
++		cpumask_set_cpu(cpu, &cpumask->cpumask);
++}
++
++__used noinline void bpf_cpumask_clear_cpu(u32 cpu, struct bpf_cpumask *cpumask)
++{
++	if (cpumask && cpu < nr_cpu_ids)
++		cpumask_clear_cpu(cpu, &cpumask->cpumask);
++}
++
++__used noinline bool bpf_cpumask_test_and_set_cpu(u32 cpu, struct bpf_cpumask *cpumask)
++{
++	if (!cpumask || cpu >= nr_cpu_ids)
++		return false;
++	return cpumask_test_and_set_cpu(cpu, &cpumask->cpumask);
++}
++
++__used noinline bool bpf_cpumask_test_and_clear_cpu(u32 cpu, struct bpf_cpumask *cpumask)
++{
++	if (!cpumask || cpu >= nr_cpu_ids)
++		return false;
++	return cpumask_test_and_clear_cpu(cpu, &cpumask->cpumask);
++}
++
++__used noinline bool bpf_cpumask_and(struct bpf_cpumask *dst,
++				     const struct cpumask *src1,
++				     const struct cpumask *src2)
++{
++	if (!dst || !src1 || !src2)
++		return false;
++	return cpumask_and(&dst->cpumask, src1, src2);
++}
++
++__used noinline void bpf_cpumask_or(struct bpf_cpumask *dst,
++				    const struct cpumask *src1,
++				    const struct cpumask *src2)
++{
++	if (dst && src1 && src2)
++		cpumask_or(&dst->cpumask, src1, src2);
++}
++
++__used noinline void bpf_cpumask_xor(struct bpf_cpumask *dst,
++				     const struct cpumask *src1,
++				     const struct cpumask *src2)
++{
++	if (dst && src1 && src2)
++		cpumask_xor(&dst->cpumask, src1, src2);
++}
++
++__used noinline bool bpf_cpumask_equal(const struct cpumask *src1,
++				       const struct cpumask *src2)
++{
++	if (!src1 || !src2)
++		return false;
++	return cpumask_equal(src1, src2);
++}
++
++__used noinline bool bpf_cpumask_intersects(const struct cpumask *src1,
++					    const struct cpumask *src2)
++{
++	if (!src1 || !src2)
++		return false;
++	return cpumask_intersects(src1, src2);
++}
++
++__used noinline bool bpf_cpumask_subset(const struct cpumask *src1,
++					const struct cpumask *src2)
++{
++	if (!src1 || !src2)
++		return false;
++	return cpumask_subset(src1, src2);
++}
++
++__used noinline bool bpf_cpumask_empty(const struct cpumask *cpumask)
++{
++	if (!cpumask)
++		return true;
++	return cpumask_empty(cpumask);
++}
++
++__used noinline bool bpf_cpumask_full(const struct cpumask *cpumask)
++{
++	if (!cpumask)
++		return false;
++	return cpumask_full(cpumask);
++}
++
++__used noinline void bpf_cpumask_copy(struct bpf_cpumask *dst,
++				      const struct cpumask *src)
++{
++	if (dst && src)
++		cpumask_copy(&dst->cpumask, src);
++}
++
++__used noinline u32 bpf_cpumask_weight(const struct cpumask *cpumask)
++{
++	if (!cpumask)
++		return 0;
++	return cpumask_weight(cpumask);
++}
++
++__used noinline u32 bpf_cpumask_any_distribute(const struct cpumask *cpumask)
++{
++	if (!cpumask)
++		return nr_cpu_ids;
++	return cpumask_any_distribute(cpumask);
++}
++
++__used noinline u32 bpf_cpumask_any_and_distribute(const struct cpumask *src1,
++						   const struct cpumask *src2)
++{
++	if (!src1 || !src2)
++		return nr_cpu_ids;
++	return cpumask_any_and_distribute(src1, src2);
++}
++
++__used noinline u32 bpf_cpumask_first(const struct cpumask *cpumask)
++{
++	if (!cpumask)
++		return nr_cpu_ids;
++	return cpumask_first(cpumask);
++}
++
++__used noinline u32 bpf_cpumask_first_zero(const struct cpumask *cpumask)
++{
++	if (!cpumask)
++		return nr_cpu_ids;
++	return cpumask_first_zero(cpumask);
++}
++
++__used noinline void bpf_cpumask_setall(struct bpf_cpumask *cpumask)
++{
++	if (cpumask)
++		cpumask_setall(&cpumask->cpumask);
++}
++
++__used noinline int bpf_cpumask_populate(struct bpf_cpumask *dst, void *src,
++					 size_t src__sz)
++{
++	unsigned long source = (unsigned long)src;
++
++	/* The memory region must be able to hold the entire CPU mask. */
++	if (!dst)
++		return -EINVAL;
++	if (src__sz < bitmap_size(nr_cpu_ids))
++		return -EACCES;
++
++	/* The input must be naturally aligned if unaligned access is slow. */
++	if (!IS_ENABLED(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) &&
++	    !IS_ALIGNED(source, sizeof(long)))
++		return -EINVAL;
++
++	bitmap_copy(cpumask_bits(&dst->cpumask), src, nr_cpu_ids);
++
++	return 0;
++}
++
++__diag_pop();
++
++BTF_SET8_START(bpf_sched_ext_kfunc_ids)
++BTF_ID_FLAGS(func, scx_bpf_create_dsq, KF_SLEEPABLE)
++BTF_ID_FLAGS(func, scx_bpf_destroy_dsq)
++BTF_ID_FLAGS(func, scx_bpf_dsq_insert___v2)
++BTF_ID_FLAGS(func, scx_bpf_dsq_insert)
++BTF_ID_FLAGS(func, scx_bpf_dispatch)
++BTF_ID_FLAGS(func, __scx_bpf_dsq_insert_vtime)
++BTF_ID_FLAGS(func, scx_bpf_dsq_insert_vtime)
++BTF_ID_FLAGS(func, scx_bpf_dispatch_vtime)
++BTF_ID_FLAGS(func, scx_bpf_dsq_move_to_local)
++BTF_ID_FLAGS(func, scx_bpf_dsq_move_to_local___v2)
++BTF_ID_FLAGS(func, scx_bpf_consume)
++BTF_ID_FLAGS(func, scx_bpf_kick_cpu)
++BTF_ID_FLAGS(func, scx_bpf_task_cpu)
++BTF_ID_FLAGS(func, scx_bpf_task_running)
++BTF_ID_FLAGS(func, scx_bpf_task_set_slice)
++BTF_ID_FLAGS(func, scx_bpf_task_set_dsq_vtime)
++BTF_ID_FLAGS(func, scx_bpf_cpuperf_set)
++BTF_ID_FLAGS(func, scx_bpf_cpuperf_cap)
++BTF_ID_FLAGS(func, scx_bpf_cpuperf_cur)
++BTF_ID_FLAGS(func, scx_bpf_get_idle_cpumask)
++BTF_ID_FLAGS(func, scx_bpf_get_idle_smtmask)
++BTF_ID_FLAGS(func, scx_bpf_put_cpumask)
++BTF_ID_FLAGS(func, scx_bpf_put_idle_cpumask)
++BTF_ID_FLAGS(func, scx_bpf_test_and_clear_cpu_idle)
++BTF_ID_FLAGS(func, scx_bpf_pick_idle_cpu)
++BTF_ID_FLAGS(func, scx_bpf_pick_any_cpu)
++BTF_ID_FLAGS(func, scx_bpf_reenqueue_local)
++BTF_ID_FLAGS(func, scx_bpf_nr_node_ids)
++BTF_ID_FLAGS(func, scx_bpf_cpu_node)
++BTF_ID_FLAGS(func, scx_bpf_cpu_rq, KF_RET_NULL)
++BTF_ID_FLAGS(func, scx_bpf_locked_rq)
++BTF_ID_FLAGS(func, scx_bpf_select_cpu_dfl)
++BTF_ID_FLAGS(func, bpf_cpumask_test_cpu)
++BTF_ID_FLAGS(func, scx_bpf_nr_cpu_ids)
++BTF_ID_FLAGS(func, scx_bpf_now)
++BTF_ID_FLAGS(func, scx_bpf_dsq_nr_queued)
++BTF_ID_FLAGS(func, scx_bpf_dispatch_nr_slots)
++BTF_ID_FLAGS(func, scx_bpf_dispatch_cancel)
++BTF_ID_FLAGS(func, scx_bpf_exit_bstr)
++BTF_ID_FLAGS(func, scx_bpf_error_bstr)
++BTF_ID_FLAGS(func, scx_bpf_dump_bstr)
++BTF_ID_FLAGS(func, scx_bpf_get_online_cpumask)
++BTF_ID_FLAGS(func, scx_bpf_get_possible_cpumask)
++BTF_ID_FLAGS(func, scx_bpf_cpu_curr, KF_RET_NULL)
++BTF_ID_FLAGS(func, scx_bpf_dsq_peek, KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_task_from_pid, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_task_acquire, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_task_release, KF_RELEASE)
++BTF_ID_FLAGS(func, bpf_rcu_read_lock)
++BTF_ID_FLAGS(func, bpf_rcu_read_unlock)
++BTF_ID_FLAGS(func, bpf_cpumask_create, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, bpf_cpumask_release, KF_RELEASE)
++BTF_ID_FLAGS(func, bpf_cpumask_acquire, KF_ACQUIRE)
++BTF_ID_FLAGS(func, bpf_cpumask_clear)
++BTF_ID_FLAGS(func, bpf_cpumask_set_cpu)
++BTF_ID_FLAGS(func, bpf_cpumask_clear_cpu)
++BTF_ID_FLAGS(func, bpf_cpumask_test_and_set_cpu)
++BTF_ID_FLAGS(func, bpf_cpumask_test_and_clear_cpu)
++BTF_ID_FLAGS(func, bpf_cpumask_and)
++BTF_ID_FLAGS(func, bpf_cpumask_or)
++BTF_ID_FLAGS(func, bpf_cpumask_xor)
++BTF_ID_FLAGS(func, bpf_cpumask_equal)
++BTF_ID_FLAGS(func, bpf_cpumask_intersects)
++BTF_ID_FLAGS(func, bpf_cpumask_subset)
++BTF_ID_FLAGS(func, bpf_cpumask_empty)
++BTF_ID_FLAGS(func, bpf_cpumask_full)
++BTF_ID_FLAGS(func, bpf_cpumask_copy)
++BTF_ID_FLAGS(func, bpf_cpumask_weight)
++BTF_ID_FLAGS(func, bpf_cpumask_any_distribute)
++BTF_ID_FLAGS(func, bpf_cpumask_any_and_distribute)
++BTF_ID_FLAGS(func, bpf_cpumask_first)
++BTF_ID_FLAGS(func, bpf_cpumask_first_zero)
++BTF_ID_FLAGS(func, bpf_cpumask_setall)
++BTF_ID_FLAGS(func, bpf_cpumask_populate)
++BTF_SET8_END(bpf_sched_ext_kfunc_ids)
++
++static const struct btf_kfunc_id_set bpf_sched_ext_kfunc_set = {
++	.owner = THIS_MODULE,
++	.set   = &bpf_sched_ext_kfunc_ids,
++};
++
++/* ==========================================================================
++ * BPF struct_ops Registration (bpf_sched_ext_ops)
++ * ========================================================================== */
++
++extern struct bpf_struct_ops bpf_sched_ext_ops;
++extern const struct bpf_func_proto bpf_get_current_task_proto;
++extern const struct bpf_func_proto bpf_get_current_task_btf_proto;
++extern const struct bpf_func_proto bpf_probe_read_kernel_proto;
++extern const struct bpf_func_proto bpf_probe_read_kernel_str_proto;
++
++static const struct bpf_func_proto *
++bpf_sched_ext_get_func_proto(enum bpf_func_id func_id,
++			     const struct bpf_prog *prog)
++{
++	switch (func_id) {
++	case BPF_FUNC_task_storage_get:
++		return &bpf_task_storage_get_proto;
++	case BPF_FUNC_task_storage_delete:
++		return &bpf_task_storage_delete_proto;
++	case BPF_FUNC_get_current_task:
++		return &bpf_get_current_task_proto;
++	case BPF_FUNC_get_current_task_btf:
++		return &bpf_get_current_task_btf_proto;
++	case BPF_FUNC_get_current_pid_tgid:
++		return &bpf_get_current_pid_tgid_proto;
++	case BPF_FUNC_get_current_uid_gid:
++		return &bpf_get_current_uid_gid_proto;
++	case BPF_FUNC_get_current_comm:
++		return &bpf_get_current_comm_proto;
++	case BPF_FUNC_get_current_cgroup_id:
++		return &bpf_get_current_cgroup_id_proto;
++	case BPF_FUNC_probe_read_kernel:
++		return &bpf_probe_read_kernel_proto;
++	case BPF_FUNC_probe_read_kernel_str:
++		return &bpf_probe_read_kernel_str_proto;
++	case BPF_FUNC_ktime_get_coarse_ns:
++		return &bpf_ktime_get_coarse_ns_proto;
++	case BPF_FUNC_get_smp_processor_id:
++		return &bpf_get_smp_processor_id_proto;
++	default:
++		return bpf_base_func_proto(func_id);
++	}
++}
++
++static bool bpf_sched_ext_is_valid_access(int off, int size,
++					  enum bpf_access_type type,
++					  const struct bpf_prog *prog,
++					  struct bpf_insn_access_aux *info)
++{
++	return bpf_tracing_btf_ctx_access(off, size, type, prog, info);
++}
++
++static int bpf_sched_ext_btf_struct_access(struct bpf_verifier_log *log,
++					   const struct btf *btf,
++					   const struct btf_type *t, int off,
++					   int size, enum bpf_access_type atype,
++					   u32 *next_btf_id,
++					   enum bpf_type_flag *flag)
++{
++	if (atype == BPF_READ)
++		return btf_struct_access(log, btf, t, off, size, atype,
++					 next_btf_id, flag);
++	return -EACCES;
++}
++
++static const struct bpf_verifier_ops bpf_sched_ext_verifier_ops = {
++	.get_func_proto		= bpf_sched_ext_get_func_proto,
++	.is_valid_access	= bpf_sched_ext_is_valid_access,
++	.btf_struct_access	= bpf_sched_ext_btf_struct_access,
++};
++
++static int bpf_sched_ext_init(struct btf *btf)
++{
++	BTF_TYPE_EMIT(struct __scx_btf_type_holder);
++	return 0;
++}
++
++static int bpf_sched_ext_check_member(const struct btf_type *t,
++				      const struct btf_member *member)
++{
++	return 0;
++}
++
++static int bpf_sched_ext_init_member(const struct btf_type *t,
++				     const struct btf_member *member,
++				     void *kdata, const void *udata)
++{
++	const struct sched_ext_ops *uops = udata;
++	struct sched_ext_ops *ops = kdata;
++	u32 moff = __btf_member_bit_offset(t, member) / 8;
++
++	switch (moff) {
++	case offsetof(struct sched_ext_ops, dispatch_max_batch):
++		ops->dispatch_max_batch = uops->dispatch_max_batch;
++		return 1;
++	case offsetof(struct sched_ext_ops, flags):
++		ops->flags = uops->flags;
++		return 1;
++	case offsetof(struct sched_ext_ops, timeout_ms):
++		ops->timeout_ms = uops->timeout_ms;
++		return 1;
++	case offsetof(struct sched_ext_ops, exit_dump_len):
++		ops->exit_dump_len = uops->exit_dump_len;
++		return 1;
++	case offsetof(struct sched_ext_ops, hotplug_seq):
++		ops->hotplug_seq = uops->hotplug_seq;
++		return 1;
++	case offsetof(struct sched_ext_ops, name):
++		if (bpf_obj_name_cpy(ops->name, uops->name,
++				     sizeof(ops->name)) <= 0)
++			return -EINVAL;
++		return 1;
++	}
++	return 0;
++}
++
++static void scx_reset_all_queues(void)
++{
++	int cpu, i;
++
++	for_each_possible_cpu(cpu) {
++		struct scx_cpu_rq *crq = &per_cpu(scx_cpu_rqs, cpu);
++		struct scx_task_oem *oem, *tmp;
++		unsigned long flags;
++
++		raw_spin_lock_irqsave(&crq->lock, flags);
++		list_for_each_entry_safe(oem, tmp, &crq->local_dsq, node) {
++			list_del_init(&oem->node);
++			oem->dsq_slot = 0;
++			oem->queued_cpu = -1;
++			oem->flags &= ~SCX_TF_QUEUED;
++		}
++		for (i = 0; i < SCX_MAX_USER_DSQS; i++) {
++			list_for_each_entry_safe(oem, tmp, &crq->user_dsqs[i], node) {
++				list_del_init(&oem->node);
++				oem->dsq_slot = 0;
++				oem->queued_cpu = -1;
++				oem->flags &= ~SCX_TF_QUEUED;
++			}
++			crq->user_nr_queued[i] = 0;
++		}
++		crq->nr_queued = 0;
++		crq->local_nr_queued = 0;
++		raw_spin_unlock_irqrestore(&crq->lock, flags);
++	}
++}
++
++static __nocfi int bpf_scx_reg(void *kdata)
++{
++	struct sched_ext_ops *ops = kdata;
++	struct task_struct *g, *p;
++	int ret = 0;
++
++	mutex_lock(&scx_ops_mutex);
++	if (scx_enabled()) {
++		mutex_unlock(&scx_ops_mutex);
++		return -EBUSY;
++	}
++
++	scx_reset_all_queues();
++	memset(&scx_active_exit_info, 0, sizeof(scx_active_exit_info));
++	scx_active_exit_info.kind = SCX_EXIT_NONE;
++	scx_active_exit_info.exit_cpu = -1;
++	scx_active_exit_info.reason = scx_exit_reason_buf;
++	scx_active_exit_info.msg = scx_exit_msg_buf;
++	scx_active_exit_info.dump = scx_exit_dump_buf;
++
++	memcpy(&scx_active_ops, ops, sizeof(scx_active_ops));
++
++	if (scx_active_ops.init) {
++		ret = scx_active_ops.init();
++		if (ret) {
++			memset(&scx_active_ops, 0, sizeof(scx_active_ops));
++			mutex_unlock(&scx_ops_mutex);
++			return ret;
++		}
++	}
++
++	rcu_read_lock();
++	for_each_process_thread(g, p) {
++		struct scx_task_oem *oem = scx_task_data(p);
++		if (scx_active_ops.init_task && !(oem->flags & SCX_TF_INITED)) {
++			struct scx_init_task_args args = {
++				.fork = false,
++				.cgroup = task_dfl_cgroup(p),
++			};
++			scx_active_ops.init_task(p, &args);
++			oem->flags |= SCX_TF_INITED;
++		}
++		if (scx_active_ops.enable && p->sched_class == &fair_sched_class)
++			scx_active_ops.enable(p);
++	}
++	rcu_read_unlock();
++
++	atomic64_inc(&scx_enable_seq);
++	static_branch_enable(&scx_ops_enabled_key);
++	pr_info("sched_ext: BPF scheduler \"%s\" enabled\n", scx_active_ops.name);
++	mutex_unlock(&scx_ops_mutex);
++	return 0;
++}
++
++static __nocfi void bpf_sched_ext_unreg(void *kdata)
++{
++	mutex_lock(&scx_ops_mutex);
++	if (!scx_enabled()) {
++		mutex_unlock(&scx_ops_mutex);
++		return;
++	}
++
++	static_branch_disable(&scx_ops_enabled_key);
++	synchronize_rcu();
++
++	if (scx_active_exit_info.kind == SCX_EXIT_NONE)
++		scx_active_exit_info.kind = SCX_EXIT_UNREG;
++
++	if (scx_active_ops.exit)
++		scx_active_ops.exit(&scx_active_exit_info);
++
++	scx_reset_all_queues();
++	pr_info("sched_ext: BPF scheduler \"%s\" disabled\n", scx_active_ops.name);
++	memset(&scx_active_ops, 0, sizeof(scx_active_ops));
++	mutex_unlock(&scx_ops_mutex);
++}
++
++struct bpf_struct_ops bpf_sched_ext_ops = {
++	.verifier_ops	= &bpf_sched_ext_verifier_ops,
++	.reg		= bpf_scx_reg,
++	.unreg		= bpf_sched_ext_unreg,
++	.check_member	= bpf_sched_ext_check_member,
++	.init_member	= bpf_sched_ext_init_member,
++	.init		= bpf_sched_ext_init,
++	.name		= "sched_ext_ops",
++};
++
++/* ==========================================================================
++ * Scheduler Hooks Called from fair.c
++ * ========================================================================== */
++
++__nocfi int scx_select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
++{
++	struct scx_task_oem *oem;
++	s32 target_cpu = -1;
++
++	if (!scx_enabled() || !scx_active_ops.select_cpu)
++		return -1;
++
++	if (p->nr_cpus_allowed <= 1 || is_migration_disabled(p))
++		return -1;
++
++	oem = scx_task_data(p);
++	oem->selected_cpu = -1;
++
++	this_cpu_write(scx_in_select_cpu, 1);
++	rcu_read_lock();
++	target_cpu = scx_active_ops.select_cpu(p, prev_cpu, (u64)wake_flags);
++	rcu_read_unlock();
++	this_cpu_write(scx_in_select_cpu, 0);
++
++	if (oem->selected_cpu >= 0 && oem->selected_cpu < nr_cpu_ids &&
++	    cpumask_test_cpu(oem->selected_cpu, p->cpus_ptr) &&
++	    cpu_online(oem->selected_cpu)) {
++		return oem->selected_cpu;
++	}
++
++	if (target_cpu >= 0 && target_cpu < nr_cpu_ids &&
++	    cpumask_test_cpu(target_cpu, p->cpus_ptr) &&
++	    cpu_online(target_cpu)) {
++		oem->selected_cpu = target_cpu;
++		return target_cpu;
++	}
++
++	return -1;
++}
++
++__nocfi void scx_enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
++{
++	struct scx_task_oem *oem;
++	int cpu = cpu_of(rq);
++	u64 enq_flags = 0;
++
++	if (cpumask_test_and_clear_cpu(cpu, &scx_idle_cpumask_storage) &&
++	    scx_enabled() && scx_active_ops.update_idle) {
++		rcu_read_lock();
++		scx_active_ops.update_idle(cpu, false);
++		rcu_read_unlock();
++	}
++
++	if (!scx_enabled())
++		return;
++
++	oem = scx_task_data(p);
++	oem->weight = p->prio < 120 ? 200 : 100;
++
++	if (flags & ENQUEUE_WAKEUP)
++		enq_flags |= SCX_ENQ_WAKEUP;
++	if (flags & ENQUEUE_HEAD)
++		enq_flags |= SCX_ENQ_HEAD;
++
++	rcu_read_lock();
++	if (scx_active_ops.init_task && unlikely(!(oem->flags & SCX_TF_INITED))) {
++		struct scx_init_task_args args = {
++			.fork = false,
++			.cgroup = task_dfl_cgroup(p),
++		};
++		scx_active_ops.init_task(p, &args);
++		oem->flags |= SCX_TF_INITED;
++	}
++
++	if ((flags & ENQUEUE_WAKEUP) && scx_active_ops.runnable)
++		scx_active_ops.runnable(p, enq_flags);
++
++	if (oem->flags & SCX_TF_DIRECT_LOCAL) {
++		u8 direct_slot = oem->dsq_slot >= 1 ? oem->dsq_slot : 1;
++		oem->flags &= ~SCX_TF_DIRECT_LOCAL;
++		scx_task_insert_on_cpu(p, cpu, direct_slot, oem->slice,
++				       oem->dsq_vtime, direct_slot > 1, enq_flags);
++	} else if (scx_active_ops.enqueue) {
++		scx_active_ops.enqueue(p, enq_flags);
++		if (!(oem->flags & SCX_TF_QUEUED))
++			scx_task_insert_on_cpu(p, cpu, 1, SCX_SLICE_DFL, 0, false, enq_flags);
++	} else {
++		scx_task_insert_on_cpu(p, cpu, 1, SCX_SLICE_DFL, 0, false, enq_flags);
++	}
++	rcu_read_unlock();
++}
++
++__nocfi void scx_dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
++{
++	scx_task_unlink(p);
++
++	if (!scx_enabled())
++		return;
++
++	rcu_read_lock();
++	if ((flags & DEQUEUE_SLEEP) && scx_active_ops.stopping)
++		scx_active_ops.stopping(p, false);
++	if (scx_active_ops.dequeue)
++		scx_active_ops.dequeue(p, (flags & DEQUEUE_SLEEP) ? SCX_DEQ_SLEEP : 0);
++	if ((flags & DEQUEUE_SLEEP) && scx_active_ops.quiescent)
++		scx_active_ops.quiescent(p, SCX_DEQ_SLEEP);
++	rcu_read_unlock();
++}
++
++__nocfi void scx_put_prev_task_fair(struct rq *rq, struct task_struct *prev)
++{
++	if (!scx_enabled())
++		return;
++
++	rcu_read_lock();
++	if (scx_active_ops.stopping && prev->on_rq)
++		scx_active_ops.stopping(prev, true);
++	rcu_read_unlock();
++
++	if (prev->on_rq == TASK_ON_RQ_QUEUED && task_rq(prev) == rq) {
++		struct scx_task_oem *oem = scx_task_data(prev);
++		if (!(oem->flags & SCX_TF_QUEUED)) {
++			if (scx_active_ops.enqueue) {
++				rcu_read_lock();
++				scx_active_ops.enqueue(prev, 0);
++				rcu_read_unlock();
++			}
++			if (!(oem->flags & SCX_TF_QUEUED))
++				scx_task_insert_on_cpu(prev, cpu_of(rq), 1,
++						       SCX_SLICE_DFL, 0, false, 0);
++		}
++	}
++}
++
++static bool scx_task_can_be_picked(struct rq *rq, struct task_struct *p,
++				   struct task_struct *prev)
++{
++	struct sched_entity *se;
++
++	if (!p || p->sched_class != &fair_sched_class)
++		return false;
++	if ((p != prev && p->on_cpu) || p->on_rq != TASK_ON_RQ_QUEUED)
++		return false;
++	if (task_cpu(p) != cpu_of(rq))
++		return false;
++	if (cfs_rq_of(&p->se)->curr == &p->se)
++		return false;
++
++	for (se = &p->se; se; se = se->parent) {
++		if (!se->on_rq)
++			return false;
++#ifdef CONFIG_CFS_BANDWIDTH
++		if (cfs_rq_of(se)->throttled)
++			return false;
++#endif
++	}
++	return true;
++}
++
++extern void set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se);
++
++__nocfi void scx_replace_next_task_fair(struct rq *rq, struct task_struct **p_out,
++				struct sched_entity **se_out, bool *repick_out,
++				struct task_struct *prev)
++{
++	int cpu = cpu_of(rq);
++	struct scx_cpu_rq *crq = &per_cpu(scx_cpu_rqs, cpu);
++	struct task_struct *next = NULL;
++	struct scx_task_oem *oem, *tmp;
++	unsigned long flags;
++
++	if (!scx_enabled())
++		return;
++
++	if ((crq->nr_queued > crq->local_nr_queued ||
++	     list_empty(&crq->local_dsq)) &&
++	    scx_active_ops.dispatch) {
++		this_cpu_write(scx_dispatch_cpu, cpu);
++		rcu_read_lock();
++		scx_active_ops.dispatch(cpu, prev);
++		rcu_read_unlock();
++		this_cpu_write(scx_dispatch_cpu, -1);
++	}
++
++	raw_spin_lock_irqsave(&crq->lock, flags);
++	list_for_each_entry_safe(oem, tmp, &crq->local_dsq, node) {
++		struct task_struct *cand = container_of((u64 *)oem,
++							struct task_struct,
++							android_oem_data1[0]);
++		list_del_init(&oem->node);
++		oem->dsq_slot = 0;
++		oem->queued_cpu = -1;
++		oem->flags &= ~SCX_TF_QUEUED;
++		if (crq->nr_queued > 0)
++			crq->nr_queued--;
++		if (crq->local_nr_queued > 0)
++			crq->local_nr_queued--;
++
++		if (scx_task_can_be_picked(rq, cand, prev)) {
++			next = cand;
++			break;
++		}
++	}
++	raw_spin_unlock_irqrestore(&crq->lock, flags);
++
++	if (!next)
++		return;
++
++	*p_out = next;
++	*se_out = &next->se;
++	*repick_out = true;
++
++	{
++		struct sched_entity *path[8];
++		struct sched_entity *se = &next->se;
++		int depth = 0;
++
++		for (; se && depth < 8; se = se->parent)
++			path[depth++] = se;
++		while (--depth >= 0) {
++			struct cfs_rq *cfs_rq = cfs_rq_of(path[depth]);
++			if (cfs_rq->curr != path[depth])
++				set_next_entity(cfs_rq, path[depth]);
++		}
++	}
++
++	if (scx_active_ops.running) {
++		rcu_read_lock();
++		scx_active_ops.running(next);
++		rcu_read_unlock();
++	}
++}
++
++__nocfi void scx_task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
++{
++	struct scx_task_oem *oem;
++
++	if (!scx_enabled() || !curr)
++		return;
++
++	oem = scx_task_data(curr);
++	if (scx_active_ops.tick) {
++		rcu_read_lock();
++		scx_active_ops.tick(curr);
++		rcu_read_unlock();
++	}
++
++	if (oem->slice > TICK_NSEC) {
++		oem->slice -= TICK_NSEC;
++	} else {
++		oem->slice = 0;
++		if (queued && rq->cfs.h_nr_running > 1)
++			resched_curr(rq);
++	}
++}
++
++void scx_notify_pick_idle(int cpu)
++{
++	if (cpu >= 0 && cpu < nr_cpu_ids) {
++		if (!cpumask_test_and_set_cpu(cpu, &scx_idle_cpumask_storage) &&
++		    scx_enabled() && scx_active_ops.update_idle) {
++			rcu_read_lock();
++			scx_active_ops.update_idle(cpu, true);
++			rcu_read_unlock();
++		}
++	}
++}
++
++/* ==========================================================================
++ * /sys/kernel/sched_ext/ sysfs hierarchy
++ * ========================================================================== */
++
++static ssize_t state_show(struct kobject *kobj, struct kobj_attribute *attr,
++			  char *buf)
++{
++	return sysfs_emit(buf, "%s\n", scx_enabled() ? "enabled" : "disabled");
++}
++static struct kobj_attribute scx_attr_state = __ATTR_RO(state);
++
++static ssize_t hotplug_seq_show(struct kobject *kobj,
++				struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lld\n", atomic64_read(&scx_hotplug_seq_cnt));
++}
++static struct kobj_attribute scx_attr_hotplug_seq = __ATTR_RO(hotplug_seq);
++
++static ssize_t enable_seq_show(struct kobject *kobj,
++			       struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lld\n", atomic64_read(&scx_enable_seq));
++}
++static struct kobj_attribute scx_attr_enable_seq = __ATTR_RO(enable_seq);
++
++static ssize_t ops_show(struct kobject *kobj, struct kobj_attribute *attr,
++			char *buf)
++{
++	return sysfs_emit(buf, "%s\n", scx_enabled() ? scx_active_ops.name : "");
++}
++static struct kobj_attribute scx_root_attr_ops = __ATTR_RO(ops);
++
++static struct attribute *scx_top_attrs[] = {
++	&scx_attr_state.attr,
++	&scx_attr_hotplug_seq.attr,
++	&scx_attr_enable_seq.attr,
++	NULL,
++};
++
++static const struct attribute_group scx_top_attr_group = {
++	.attrs = scx_top_attrs,
++};
++
++static struct attribute *scx_root_attrs[] = {
++	&scx_root_attr_ops.attr,
++	NULL,
++};
++
++static const struct attribute_group scx_root_attr_group = {
++	.attrs = scx_root_attrs,
++};
++
++static struct kobject *scx_kobj;
++static struct kobject *scx_root_kobj;
++
++static int __init scx_ext_init(void)
++{
++	int cpu, i, ret;
++
++	cpumask_clear(&scx_idle_cpumask_storage);
++	for_each_possible_cpu(cpu) {
++		struct scx_cpu_rq *crq = &per_cpu(scx_cpu_rqs, cpu);
++
++		raw_spin_lock_init(&crq->lock);
++		INIT_LIST_HEAD(&crq->local_dsq);
++		for (i = 0; i < SCX_MAX_USER_DSQS; i++) {
++			INIT_LIST_HEAD(&crq->user_dsqs[i]);
++			crq->user_nr_queued[i] = 0;
++		}
++		crq->nr_queued = 0;
++		crq->local_nr_queued = 0;
++		crq->cpuperf_target = 1024;
++		per_cpu(scx_in_select_cpu, cpu) = 0;
++		per_cpu(scx_dispatch_cpu, cpu) = -1;
++	}
++
++	/*
++	 * Register the sched_ext kfunc set for every program type that has a
++	 * kfunc hook. Keep the calls independent so that one unsupported
++	 * program type cannot skip the remaining registrations.
++	 */
++	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
++					&bpf_sched_ext_kfunc_set);
++	if (ret)
++		pr_warn("sched_ext: failed to register struct_ops kfunc set: %d\n", ret);
++	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING,
++					&bpf_sched_ext_kfunc_set);
++	if (ret)
++		pr_warn("sched_ext: failed to register tracing kfunc set: %d\n", ret);
++	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_RAW_TRACEPOINT,
++					&bpf_sched_ext_kfunc_set);
++	if (ret)
++		pr_warn("sched_ext: failed to register raw_tp kfunc set: %d\n", ret);
++	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL,
++					&bpf_sched_ext_kfunc_set);
++	if (ret)
++		pr_warn("sched_ext: failed to register syscall kfunc set: %d\n", ret);
++
++	scx_kobj = kobject_create_and_add("sched_ext", kernel_kobj);
++	if (scx_kobj) {
++		if (sysfs_create_group(scx_kobj, &scx_top_attr_group) == 0) {
++			scx_root_kobj = kobject_create_and_add("root", scx_kobj);
++			if (scx_root_kobj)
++				(void)sysfs_create_group(scx_root_kobj,
++							 &scx_root_attr_group);
++		}
++	}
++
++	return 0;
++}
++late_initcall(scx_ext_init);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index d39deceb0d0d..36bd18b33b6f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -53,6 +53,7 @@
+ #include <linux/sched/cond_resched.h>
+ 
+ #include "sched.h"
++#include <linux/sched/ext.h>
+ #include "stats.h"
+ #include "autogroup.h"
+ 
+@@ -804,8 +805,10 @@ void init_entity_runnable_average(struct sched_entity *se)
+ 	 * Group entities are initialized with zero load to reflect the fact that
+ 	 * nothing has been attached to the task group yet.
+ 	 */
+-	if (entity_is_task(se))
++	if (entity_is_task(se)) {
+ 		sa->load_avg = scale_load_down(se->load.weight);
++		scx_task_fork(task_of(se));
++	}
+ 
+ 	/* when this task enqueue'ed, it will contribute to its cfs_rq's load_avg */
+ }
+@@ -6157,6 +6160,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 	struct sched_entity *se = &p->se;
+ 	int idle_h_nr_running = task_has_idle_policy(p);
+ 	int task_new = !(flags & ENQUEUE_WAKEUP);
++	int orig_flags = flags;
+ 	int should_iowait_boost;
+ 
+ 	/*
+@@ -6237,7 +6241,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 
+ enqueue_throttle:
+ 	assert_list_leaf_cfs_rq(rq);
+-
++	scx_enqueue_task_fair(rq, p, orig_flags);
+ 	hrtick_update(rq);
+ }
+ 
+@@ -6253,6 +6257,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 	struct cfs_rq *cfs_rq;
+ 	struct sched_entity *se = &p->se;
+ 	int task_sleep = flags & DEQUEUE_SLEEP;
++	int orig_flags = flags;
+ 	int idle_h_nr_running = task_has_idle_policy(p);
+ 	bool was_sched_idle = sched_idle_rq(rq);
+ 
+@@ -6315,6 +6320,7 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 		rq->next_balance = jiffies;
+ 
+ dequeue_throttle:
++	scx_dequeue_task_fair(rq, p, orig_flags);
+ 	util_est_update(&rq->cfs, p, task_sleep);
+ 	hrtick_update(rq);
+ }
+@@ -7550,6 +7556,11 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 	if (trace_android_rvh_select_task_rq_fair_enabled() &&
+ 	    !(sd_flag & SD_BALANCE_FORK))
+ 		sync_entity_load_avg(&p->se);
++	if (scx_enabled()) {
++		target_cpu = scx_select_task_rq_fair(p, prev_cpu, wake_flags);
++		if (target_cpu >= 0)
++			return target_cpu;
++	}
+ 	trace_android_rvh_select_task_rq_fair(p, prev_cpu, sd_flag,
+ 			wake_flags, &target_cpu);
+ 	if (target_cpu >= 0)
+@@ -7618,6 +7629,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
+ {
+ 	struct sched_entity *se = &p->se;
++	scx_dequeue_task_fair(task_rq(p), p, 0);
+ 
+ 	/*
+ 	 * As blocked tasks retain absolute vruntime the migration needs to
+@@ -7905,7 +7917,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 		goto idle;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+-	if (!prev || prev->sched_class != &fair_sched_class)
++	if (!prev || prev->sched_class != &fair_sched_class || scx_enabled())
+ 		goto simple;
+ 
+ 	/*
+@@ -7988,6 +8000,11 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 	if (prev)
+ 		put_prev_task(rq, prev);
+ 
++	if (scx_enabled()) {
++		scx_replace_next_task_fair(rq, &p, &se, &repick, prev);
++		if (repick)
++			goto done;
++	}
+ 	trace_android_rvh_replace_next_task_fair(rq, &p, &se, &repick, true, prev);
+ 	if (repick)
+ 		goto done;
+@@ -7999,6 +8016,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 	} while (cfs_rq);
+ 
+ 	p = task_of(se);
++	scx_task_picked_fallback(p);
+ 
+ done: __maybe_unused;
+ #ifdef CONFIG_SMP
+@@ -8034,6 +8052,8 @@ done: __maybe_unused;
+ 			goto again;
+ 	}
+ 
++	scx_notify_pick_idle(cpu_of(rq));
++
+ 	return NULL;
+ }
+ 
+@@ -8054,6 +8074,7 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev)
+ 		cfs_rq = cfs_rq_of(se);
+ 		put_prev_entity(cfs_rq, se);
+ 	}
++	scx_put_prev_task_fair(rq, prev);
+ }
+ 
+ /*
+@@ -12021,6 +12042,7 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
+ 	check_update_overutilized_status(task_rq(curr));
+ 
+ 	task_tick_core(rq, curr);
++	scx_task_tick_fair(rq, curr, queued);
+ }
+ 
+ /*
+-- 
+2.53.0
+

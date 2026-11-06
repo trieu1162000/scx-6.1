@@ -1,0 +1,29 @@
+name: 6.1-backport
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang libelf-dev zlib1g-dev libzstd-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the 6.1 schedulers
+        run: |
+          cargo build --release \
+            -p scx_lavd_k61 -p scx_p2dq_k61 -p scx_fcp
+
+      - name: scx_utils unit tests
+        run: cargo test -p scx_utils --lib -- compat::tests::test_

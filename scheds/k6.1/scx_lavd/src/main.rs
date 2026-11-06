@@ -1236,6 +1236,10 @@ fn init_log(opts: &Opts) {
 
 #[clap_main::clap_main]
 fn main(mut opts: Opts) -> Result<()> {
+    // This binary targets the Linux 6.1 sched_ext backport; select its enum
+    // ABI before any enum is read (the BPF skeleton is opened later).
+    compat::set_enum_abi(compat::EnumAbi::Linux61);
+
     if opts.version {
         println!(
             "scx_lavd {}",

@@ -413,16 +413,13 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	if (!cpuc_cur)
 		return;
 
-	cpumask = cpuc_cur->temp_mask;
+	cpumask = &cpuc_cur->temp_mask;
 	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
 	cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpdom_id]);
-	if (!cpdomc || !cd_cpumask || !cpumask)
+	if (!cpdomc || !cd_cpumask)
 		return;
 
-	struct bpf_cpumask *dst_mask = (struct bpf_cpumask *)cpumask;
-	if (dst_mask) {
-		bpf_cpumask_and(dst_mask, cast_mask(cd_cpumask), p->cpus_ptr);
-	}
+	bpf_cpumask_and(cpumask, cast_mask(cd_cpumask), p->cpus_ptr);
 
 	/*
 	 * Find a victim CPU among CPUs that run lower-priority tasks.

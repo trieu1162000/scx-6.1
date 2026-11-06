@@ -380,6 +380,25 @@ struct cpu_ctx *get_cpu_ctx_id(s32 cpu_id);
 struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 
 /*
+ * Per-CPU scratch for plan_x_cpdom_migration() and its bpf_loop() callbacks.
+ *
+ * The 6.1 bpf_loop() callback context argument must be a stack pointer or
+ * NULL (ARG_PTR_TO_STACK_OR_NULL), so the shared walk state cannot be passed
+ * by pointer. Keeping it in the per-CPU cpu_ctx instead lets
+ * plan_x_cpdom_migration() drop its two 32-byte stack contexts and keeps the
+ * bpf_loop() callbacks free of stack copies.
+ */
+struct cpdom_mig_scratch {
+	u64	total_load_invr;
+	u64	total_cap_sum;
+	u64	max_avg_util_wall;
+	u64	mig_delta_factor;
+	u32	nz_qlen;
+	u32	nr_stealee;
+	bool	overflow_running;
+};
+
+/*
  * CPU context
  */
 struct cpu_ctx {
@@ -569,9 +588,14 @@ struct cpu_ctx {
 	u64		prev_pelt_clk;
 
 	/* --- cacheline 4 boundary (256 bytes): cpumask scratch --- */
-	struct bpf_cpumask __kptr *a_mask;	/* scratch: task & active */
-	struct bpf_cpumask __kptr *o_mask;	/* scratch: task & overflow */
-	struct bpf_cpumask __kptr *temp_mask;	/* scratch: general-purpose */
+	/*
+	 * Scratch cpumasks. These live in cpu_ctx_stor, a per-CPU array map,
+	 * and per-CPU maps cannot host __kptr fields. Keep them as plain
+	 * embedded struct bpf_cpumask, the same way cpdom_cpumask is stored.
+	 */
+	struct bpf_cpumask a_mask;	/* scratch: task & active */
+	struct bpf_cpumask o_mask;	/* scratch: task & overflow */
+	struct bpf_cpumask temp_mask;	/* scratch: general-purpose */
 
 	struct ravg_data avg_irq_steal_ravg;	/* Running average of IRQ steal utilization using ravg */
 	struct ravg_data avg_util_ravg;	/* Running average of CPU utilization using ravg */
@@ -586,6 +610,9 @@ struct cpu_ctx {
 	u64	qload_invr __attribute__((aligned(CACHELINE_SIZE)));
 	u64	qload_svc_invr;		/* queued service time: sum of avg_runtime_invr,
 					   same write pattern as qload_invr above */
+
+	/* --- per-CPU scratch for plan_x_cpdom_migration() --- */
+	struct cpdom_mig_scratch cpdom_mig;
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 extern const volatile u64	nr_llcs;	/* number of LLC domains */
@@ -875,11 +902,11 @@ static __always_inline u32 task_load_metric(task_ctx *taskc)
 	return taskc->util_est;
 }
 
-extern struct bpf_cpumask __kptr *turbo_cpumask; /* CPU mask for turbo CPUs */
-extern struct bpf_cpumask __kptr *big_cpumask; /* CPU mask for big CPUs */
-extern struct bpf_cpumask __kptr *active_cpumask; /* CPU mask for active CPUs */
-extern struct bpf_cpumask __kptr *ovrflw_cpumask; /* CPU mask for overflow CPUs */
-extern struct bpf_cpumask __kptr *steady_cpumask; /* CPU mask for non-turbulent (steady) CPUs */
+extern struct bpf_cpumask turbo_cpumask; /* CPU mask for turbo CPUs */
+extern struct bpf_cpumask big_cpumask; /* CPU mask for big CPUs */
+extern struct bpf_cpumask active_cpumask; /* CPU mask for active CPUs */
+extern struct bpf_cpumask ovrflw_cpumask; /* CPU mask for overflow CPUs */
+extern struct bpf_cpumask steady_cpumask; /* CPU mask for non-turbulent (steady) CPUs */
 
 /* DSQ helpers. */
 

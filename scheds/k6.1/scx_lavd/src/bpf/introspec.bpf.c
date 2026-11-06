@@ -103,12 +103,18 @@ int submit_task_ctx(struct task_struct *p, task_ctx __arg_arena *taskc, u32 cpu_
 static void proc_introspec_sched_n(struct task_struct *p,
 				   task_ctx __arg_arena *taskc)
 {
+	char comm[8];
 	u64 cur_nr, prev_nr;
 	u32 cpu_id;
 	int i;
 
-	/* do not introspect itself */
-	if (bpf_strncmp(p->comm, 8, "scx_lavd") == 0)
+	/*
+	 * Do not introspect itself. 6.1's bpf_strncmp() only accepts verifier
+	 * memory (ARG_PTR_TO_MEM), not a PTR_TO_BTF_ID, so bounce p->comm
+	 * through the stack first.
+	 */
+	bpf_core_read_str(comm, sizeof(comm), &p->comm);
+	if (bpf_strncmp(comm, sizeof(comm), "scx_lavd") == 0)
 		return;
 
 	/* introspec_arg is the number of schedules remaining */

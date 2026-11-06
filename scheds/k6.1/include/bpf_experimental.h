@@ -356,7 +356,12 @@ l_true:												\
  * Note that cond_break can only be portably used in the body of a breakable
  * construct, whereas can_loop can be used anywhere.
  */
-#ifdef __BPF_FEATURE_MAY_GOTO
+#if defined(SCX_FCP_ANDROID_61)
+/* Android 6.1 lacks BPF may_goto (opcode 0xe5) entirely: fall back to
+ * plain, explicitly-bounded loops like the unit-test build does. */
+#define can_loop true
+#define __cond_break(expr) expr
+#elif defined(__BPF_FEATURE_MAY_GOTO)
 #define can_loop					\
 	({ __label__ l_break, l_continue;		\
 	bool ret = true;				\

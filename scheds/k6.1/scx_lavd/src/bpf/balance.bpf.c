@@ -22,11 +22,15 @@ extern const volatile u8	no_fast_lb;
 extern const volatile u8	no_force_steal_limit;
 extern const volatile u64	lb_low_util_wall;
 
-u64 __attribute__ ((noinline)) calc_mig_delta(u64 base_share_invr, int nz_qlen,
-					      u64 mig_delta_factor)
+/*
+ * Kept inline: this is only called from classify_cpdom() below, which is in
+ * turn inlined into classify_cpdom_cb(). Folding both into the callback keeps
+ * two 32-byte frames out of the lavd_cpu_online() verifier stack chain.
+ */
+static __always_inline u64
+calc_mig_delta(u64 base_share_invr, int nz_qlen, u64 mig_delta_factor)
 {
 	/*
-	 * Note that added "noinline" to make the verifier happy.
 	 * When mig_delta_factor > 0, the user specified a fixed
 	 * migration delta percentage; otherwise use the dynamic
 	 * shift-based heuristic.
@@ -43,10 +47,10 @@ u64 __attribute__ ((noinline)) calc_mig_delta(u64 base_share_invr, int nz_qlen,
 /*
  * Classify a single compute domain as stealer, stealee, or neutral.
  * Returns 1 if the domain became a stealee, 0 otherwise.
- * Marked noinline so the verifier analyses it separately from the
- * calling loop, keeping the jump complexity of the caller manageable.
+ * Inlined into classify_cpdom_cb() so the verifier stack chain does not grow
+ * a frame for each helper; the callback is verified on its own anyway.
  */
-int __attribute__((noinline))
+static __always_inline int
 classify_cpdom(struct cpdom_ctx *cpdomc, u64 total_load_invr,
 	       u64 total_cap_sum, int nz_qlen, u64 mig_delta_factor)
 {
@@ -154,58 +158,153 @@ reset_role:
 	return 0;
 }
 
+/*
+ * State shared between plan_x_cpdom_migration() and its per-compute-domain
+ * bpf_loop() callbacks lives in the per-CPU cpu_ctx (struct
+ * cpdom_mig_scratch), not on the stack: a 6.1 bpf_loop() callback context
+ * must be a stack pointer or NULL.
+ *
+ * The walk has to visit every compute domain, and on a 6.1 verifier a plain
+ * bounded loop over a variable offset is fully unrolled: each iteration
+ * indexes cpdom_ctxs[] at a different constant offset, so no state can be
+ * pruned and the states multiply. bpf_loop() instead hands the body a scalar
+ * index and verifies it once, no matter how many domains there are.
+ */
+
+/*
+ * Accommodate a compute domain's load for one balancing round. Returns 1 to
+ * stop the walk once the index leaves cpdom_ctxs[]; that cannot happen today
+ * because nr_cpdoms <= LAVD_CPDOM_MAX_NR, but it keeps the index bounded for
+ * the verifier.
+ */
+static long calc_cpdom_load_cb(u32 cpdom_id, void *arg)
+{
+	struct cpdom_mig_scratch *ctx;
+	struct cpu_ctx *cpuc;
+	struct cpdom_ctx *cpdomc;
+	u64 util;
+
+	(void)arg;
+
+	if (cpdom_id >= LAVD_CPDOM_MAX_NR)
+		return 1;
+
+	cpuc = get_cpu_ctx();
+	if (!cpuc)
+		return 1;
+	ctx = &cpuc->cpdom_mig;
+
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+	if (!cpdomc->nr_active_cpus) {
+		if (cpdomc->cur_util_wall_sum > 0)
+			ctx->overflow_running = true;
+		return 0;
+	}
+
+	util = (cpdomc->avg_util_wall_sum << LAVD_SHIFT) / cpdomc->nr_active_cpus;
+	if ((util >> LAVD_SHIFT) > ctx->max_avg_util_wall)
+		ctx->max_avg_util_wall = util >> LAVD_SHIFT;
+
+	/*
+	 * Domain load combines running load (avg_util_invr_sum)
+	 * and queued load (qload_invr, tracked atomically via
+	 * account/unaccount at enqueue/running).
+	 */
+	if (no_fast_lb) {
+		u64 qlen = cpdomc->nr_queued_task;
+		u64 qlen_invr = (qlen << (LAVD_SHIFT * 3)) /
+				cpdomc->cap_sum_active_cpus;
+		cpdomc->load_invr = util + qlen_invr;
+		if (qlen)
+			ctx->nz_qlen++;
+	} else {
+		cpdomc->load_invr = cpdomc->avg_util_invr_sum +
+				    cpdomc->qload_invr;
+		if (cpdomc->qload_invr)
+			ctx->nz_qlen++;
+	}
+	ctx->total_load_invr += cpdomc->load_invr;
+	ctx->total_cap_sum += cpdomc->cap_sum_active_cpus;
+
+	return 0;
+}
+
+static long classify_cpdom_cb(u32 cpdom_id, void *arg)
+{
+	struct cpdom_mig_scratch *ctx;
+	struct cpu_ctx *cpuc;
+	struct cpdom_ctx *cpdomc;
+
+	(void)arg;
+
+	if (cpdom_id >= LAVD_CPDOM_MAX_NR)
+		return 1;
+
+	cpuc = get_cpu_ctx();
+	if (!cpuc)
+		return 1;
+	ctx = &cpuc->cpdom_mig;
+
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+	ctx->nr_stealee += classify_cpdom(cpdomc, ctx->total_load_invr,
+					  ctx->total_cap_sum, ctx->nz_qlen,
+					  ctx->mig_delta_factor);
+	return 0;
+}
+
+static long reset_cpdom_role_cb(u32 cpdom_id, void *arg)
+{
+	struct cpdom_ctx *cpdomc;
+
+	(void)arg;
+
+	if (cpdom_id >= LAVD_CPDOM_MAX_NR)
+		return 1;
+
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+	WRITE_ONCE(cpdomc->stealee_budget_invr, 0);
+	WRITE_ONCE(cpdomc->stealer_budget_invr, 0);
+	WRITE_ONCE(cpdomc->is_stealer, false);
+	WRITE_ONCE(cpdomc->is_stealee, false);
+	return 0;
+}
+
 __weak
 int plan_x_cpdom_migration(void)
 {
-	struct cpdom_ctx *cpdomc;
-	u64 cpdom_id;
+	struct cpdom_mig_scratch *mig;
+	struct cpu_ctx *cpuc;
 	u32 nr_stealee = 0;
 	u64 max_avg_util_wall = 0;
-	u64 util;
 	u64 total_load_invr = 0;
 	u64 total_cap_sum = 0;
 	bool overflow_running = false;
 	int nz_qlen = 0;
+	u64 mig_delta_factor = 0;
+
+	cpuc = get_cpu_ctx();
+	if (!cpuc)
+		return 0;
+	mig = &cpuc->cpdom_mig;
+
+	mig->total_load_invr = 0;
+	mig->total_cap_sum = 0;
+	mig->max_avg_util_wall = 0;
+	mig->mig_delta_factor = 0;
+	mig->nz_qlen = 0;
+	mig->nr_stealee = 0;
+	mig->overflow_running = false;
 
 	/*
 	 * Calculate load for each active compute domain.
 	 */
-	bpf_for(cpdom_id, 0, nr_cpdoms) {
-		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
-			break;
+	bpf_loop(nr_cpdoms, calc_cpdom_load_cb, NULL, 0);
 
-		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-		if (!cpdomc->nr_active_cpus) {
-			if (cpdomc->cur_util_wall_sum > 0)
-				overflow_running = true;
-			continue;
-		}
-
-		util = (cpdomc->avg_util_wall_sum << LAVD_SHIFT) / cpdomc->nr_active_cpus;
-		if ((util >> LAVD_SHIFT) > max_avg_util_wall)
-			max_avg_util_wall = util >> LAVD_SHIFT;
-
-		/*
-		 * Domain load combines running load (avg_util_invr_sum)
-		 * and queued load (qload_invr, tracked atomically via
-		 * account/unaccount at enqueue/running).
-		 */
-		if (no_fast_lb) {
-			u64 qlen = cpdomc->nr_queued_task;
-			u64 qlen_invr = (qlen << (LAVD_SHIFT * 3)) /
-					cpdomc->cap_sum_active_cpus;
-			cpdomc->load_invr = util + qlen_invr;
-			if (qlen)
-				nz_qlen++;
-		} else {
-			cpdomc->load_invr = cpdomc->avg_util_invr_sum +
-					    cpdomc->qload_invr;
-			if (cpdomc->qload_invr)
-				nz_qlen++;
-		}
-		total_load_invr += cpdomc->load_invr;
-		total_cap_sum += cpdomc->cap_sum_active_cpus;
-	}
+	max_avg_util_wall = mig->max_avg_util_wall;
+	total_load_invr = mig->total_load_invr;
+	total_cap_sum = mig->total_cap_sum;
+	nz_qlen = mig->nz_qlen;
+	overflow_running = mig->overflow_running;
 
 	/*
 	 * When the highest per-CPU utilization among all compute
@@ -221,20 +320,17 @@ int plan_x_cpdom_migration(void)
 	 * fair share of total system load scaled by its capacity
 	 * proportion.
 	 */
-	u64 mig_delta_factor = 0;
 	if (mig_delta_pct > 0)
 		mig_delta_factor = (mig_delta_pct << LAVD_SHIFT) / 100;
 
-	bpf_for(cpdom_id, 0, nr_cpdoms) {
-		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
-			break;
+	mig->total_load_invr = total_load_invr;
+	mig->total_cap_sum = total_cap_sum;
+	mig->mig_delta_factor = mig_delta_factor;
+	mig->nz_qlen = nz_qlen;
+	mig->nr_stealee = 0;
 
-		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-
-		nr_stealee += classify_cpdom(cpdomc, total_load_invr,
-					     total_cap_sum, nz_qlen,
-					     mig_delta_factor);
-	}
+	bpf_loop(nr_cpdoms, classify_cpdom_cb, NULL, 0);
+	nr_stealee = mig->nr_stealee;
 
 	if (nr_stealee == 0 && !overflow_running)
 		goto reset_and_skip_lb;
@@ -245,16 +341,7 @@ int plan_x_cpdom_migration(void)
 
 reset_and_skip_lb:
 	if (sys_stat.nr_stealee > 0) {
-		bpf_for(cpdom_id, 0, nr_cpdoms) {
-			if (cpdom_id >= LAVD_CPDOM_MAX_NR)
-				break;
-
-			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-			WRITE_ONCE(cpdomc->stealee_budget_invr, 0);
-			WRITE_ONCE(cpdomc->stealer_budget_invr, 0);
-			WRITE_ONCE(cpdomc->is_stealer, false);
-			WRITE_ONCE(cpdomc->is_stealee, false);
-		}
+		bpf_loop(nr_cpdoms, reset_cpdom_role_cb, NULL, 0);
 		sys_stat.nr_stealee = 0;
 	}
 	return 0;

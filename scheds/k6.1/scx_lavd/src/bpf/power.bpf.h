@@ -5,7 +5,7 @@
  */
 #pragma once
 
-int do_core_compaction(void);
+/* do_core_compaction() is a static __always_inline helper in power.bpf.c. */
 int update_thr_perf_cri(void);
 int reinit_active_cpumask_for_performance(void);
 bool is_perf_cri(task_ctx *taskc);

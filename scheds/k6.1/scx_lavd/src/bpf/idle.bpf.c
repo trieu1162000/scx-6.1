@@ -262,10 +262,8 @@ void scx_cgroup_bw_kick_idle_cb(void)
 static __always_inline
 bool init_active_ovrflw_masks(struct pick_ctx *ctx)
 {
-	ctx->active = active_cpumask;
-	ctx->ovrflw = ovrflw_cpumask;
-	if (!ctx->active || !ctx->ovrflw)
-		return false;
+	ctx->active = &active_cpumask;
+	ctx->ovrflw = &ovrflw_cpumask;
 	return true;
 }
 
@@ -276,9 +274,7 @@ bool init_ao_masks(struct pick_ctx *ctx)
 	if (!ctx->cpuc_cur)
 		return false;
 
-	ctx->temp_mask = ctx->cpuc_cur->temp_mask;
-	if (!ctx->temp_mask)
-		return false;
+	ctx->temp_mask = &ctx->cpuc_cur->temp_mask;
 
 	/*
 	 * Evaluate the affinity once per pick, so that this function and
@@ -292,10 +288,8 @@ bool init_ao_masks(struct pick_ctx *ctx)
 		return true;
 	}
 
-	ctx->a_mask = ctx->cpuc_cur->a_mask;
-	ctx->o_mask = ctx->cpuc_cur->o_mask;
-	if (!ctx->a_mask || !ctx->o_mask)
-		return false;
+	ctx->a_mask = &ctx->cpuc_cur->a_mask;
+	ctx->o_mask = &ctx->cpuc_cur->o_mask;
 
 	bpf_cpumask_and(ctx->a_mask, ctx->p->cpus_ptr, cast_mask(ctx->active));
 	bpf_cpumask_and(ctx->o_mask, ctx->p->cpus_ptr, cast_mask(ctx->ovrflw));
@@ -329,11 +323,11 @@ bool is_preemption_vulnerable(struct pick_ctx *ctx)
 static __always_inline
 bool repartition_masks_for_latency(struct pick_ctx *ctx)
 {
-	struct bpf_cpumask *steady_set = ctx->cpuc_cur->a_mask;
-	struct bpf_cpumask *turb_set = ctx->cpuc_cur->o_mask;
-	struct bpf_cpumask *steady = steady_cpumask;
+	struct bpf_cpumask *steady_set = &ctx->cpuc_cur->a_mask;
+	struct bpf_cpumask *turb_set = &ctx->cpuc_cur->o_mask;
+	struct bpf_cpumask *steady = &steady_cpumask;
 
-	if (!steady_set || !turb_set || !steady)
+	if (!steady_set || !turb_set)
 		return false;
 
 	/*
@@ -378,9 +372,7 @@ s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur)
 	/*
 	 * online_src_mask = src_mask ∩ online_mask
 	 */
-	online_src_mask = cpuc_cur->temp_mask;
-	if (!online_src_mask)
-		return -ENOENT;
+	online_src_mask = &cpuc_cur->temp_mask;
 
 	online_mask = scx_bpf_get_online_cpumask();
 	bpf_cpumask_and(online_src_mask, src_mask, online_mask);
@@ -433,9 +425,9 @@ static s32 find_cpu_for_ovrflw_extend(struct pick_ctx *ctx)
 	if (prev_llc < 0)
 		return -ENOENT;
 
-	online_src_mask = ctx->cpuc_cur->temp_mask;
-	ovrflw = ovrflw_cpumask;
-	if (!online_src_mask || !ovrflw)
+	online_src_mask = &ctx->cpuc_cur->temp_mask;
+	ovrflw = &ovrflw_cpumask;
+	if (!ovrflw)
 		return -ENOENT;
 
 	/*
@@ -486,9 +478,9 @@ static s32 pick_idle_cpu_at_cpdom(struct pick_ctx *ctx, s64 cpdom, u64 scope)
 	 * in the order of turbo, active, and overflow.
 	 */
 	if (cpdc->nr_active_cpus && cpdc->is_big &&
-	    have_turbo_core && turbo_cpumask && ctx->a_mask) {
+	    have_turbo_core && ctx->a_mask) {
 		bpf_cpumask_and(ctx->temp_mask, cast_mask(ctx->a_mask),
-				cast_mask(turbo_cpumask));
+				cast_mask(&turbo_cpumask));
 		cpu = pick_idle_cpu_in(cpdom, cast_mask(ctx->temp_mask), scope);
 		if (cpu >= 0)
 			return cpu;
@@ -591,9 +583,11 @@ bool can_run_on_cpu(struct pick_ctx *ctx, s32 cpu)
 		return false;
 
 	a_mask = ctx->a_mask;
+	if (a_mask && bpf_cpumask_test_cpu(cpu, cast_mask(a_mask)))
+		return true;
+
 	o_mask = ctx->o_mask;
-	if ((a_mask && bpf_cpumask_test_cpu(cpu, cast_mask(a_mask))) ||
-	    (o_mask && bpf_cpumask_test_cpu(cpu, cast_mask(o_mask))))
+	if (o_mask && bpf_cpumask_test_cpu(cpu, cast_mask(o_mask)))
 		return true;
 
 	return false;

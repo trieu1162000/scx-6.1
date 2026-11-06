@@ -479,11 +479,16 @@ bool scx_bpf_task_set_dsq_vtime___new(struct task_struct *p, u64 vtime) __ksym _
 
 static inline bool scx_bpf_task_set_slice(struct task_struct *p, u64 slice)
 {
+#ifdef SCX_FCP_ANDROID_61
+	/* The 6.1 backport forbids BPF writes into task_struct; kfunc only. */
+	return scx_bpf_task_set_slice___new(p, slice);
+#else
 	if (bpf_ksym_exists(scx_bpf_task_set_slice___new))
 		return scx_bpf_task_set_slice___new(p, slice);
 	if (bpf_core_field_exists(p->scx.slice))
 		p->scx.slice = slice;
 	return true;
+#endif
 }
 
 static inline bool scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime)

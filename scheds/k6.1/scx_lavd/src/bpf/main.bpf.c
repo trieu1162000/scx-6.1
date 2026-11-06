@@ -1530,13 +1530,8 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	bpf_rcu_read_lock();
 
-	active = active_cpumask;
-	ovrflw = ovrflw_cpumask;
-	if (!active || !ovrflw) {
-		scx_bpf_error("Failed to prepare cpumasks.");
-		bpf_rcu_read_unlock();
-		return;
-	}
+	active = &active_cpumask;
+	ovrflw = &ovrflw_cpumask;
 
 	/*
 	 * If the current CPU belonges to either active or overflow set,
@@ -2341,6 +2336,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 {
 	task_ctx *taskc, *taskc_parent;
 	struct task_struct *parent;
+	bool inherited = false;
 	int i;
 	u64 now;
 
@@ -2383,14 +2379,29 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	 */
 	parent = bpf_task_from_pid(p->real_parent->pid);
 	bpf_rcu_read_lock();
-	if (parent && (taskc_parent = find_task_ctx(parent))) {
-		/* Do not inherit cgroup status. */
-		for (i = 0; i < sizeof(taskc->atq) && can_loop; i++)
-			((char __arena *)taskc)[i] = 0;
+	if (parent) {
+		taskc_parent = find_task_ctx(parent);
+		if (taskc_parent) {
+			/* Do not inherit cgroup status. */
+			for (i = 0; i < sizeof(taskc->atq) && can_loop; i++)
+				((char __arena *)taskc)[i] = 0;
 
-		for (i = sizeof(taskc->atq); i < sizeof(*taskc) && can_loop; i++)
-			((char __arena *)taskc)[i] = ((char __arena *)taskc_parent)[i];
-	} else {
+			for (i = sizeof(taskc->atq); i < sizeof(*taskc) && can_loop; i++)
+				((char __arena *)taskc)[i] = ((char __arena *)taskc_parent)[i];
+			inherited = true;
+		}
+
+		/*
+		 * Release @parent where the verifier still knows it is
+		 * non-NULL. Re-testing an already narrowed PTR_TO_BTF_ID
+		 * against NULL makes the 6.1 verifier explore a dead edge
+		 * that keeps the reference alive and then fail the load with
+		 * "Unreleased reference".
+		 */
+		bpf_task_release(parent);
+	}
+
+	if (!inherited) {
 		for (i = 0; i < sizeof(*taskc) && can_loop; i++)
 			((char __arena *)taskc)[i] = 0;
 
@@ -2424,8 +2435,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	if (is_ksoftirqd(p))
 		set_task_flag(taskc, LAVD_FLAG_KSOFTIRQD);
 
-	if (parent)
-		bpf_task_release(parent);
 	return 0;
 }
 
@@ -2519,7 +2528,7 @@ void BPF_STRUCT_OPS(lavd_dump_task, struct scx_dump_ctx *dctx,
 
 }
 
-static s32 init_cpdoms(u64 now)
+static __attribute__((noinline)) s32 init_cpdoms(u64 now)
 {
 	struct cpdom_ctx *cpdomc;
 	int err;
@@ -2573,64 +2582,30 @@ static s32 init_cpdoms(u64 now)
 	return 0;
 }
 
-static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
-{
-	struct bpf_cpumask *cpumask;
-	cpumask = bpf_cpumask_create();
-	if (!cpumask)
-		return -ENOMEM;
-
-	cpumask = bpf_kptr_xchg(p_cpumask, cpumask);
-	if (cpumask)
-		bpf_cpumask_release(cpumask);
-
-	return 0;
-}
-
-static int init_cpumasks(void)
+static __attribute__((noinline)) int init_cpumasks(void)
 {
 	const struct cpumask *online_cpumask;
-	struct bpf_cpumask *active;
-	int err = 0;
 
 	bpf_rcu_read_lock();
 	/*
-	 * Allocate active cpumask and initialize it with all online CPUs.
+	 * The global cpumasks are plain private globals, so they only need
+	 * to be initialized in place.
 	 */
-	err = calloc_cpumask(&active_cpumask);
-	active = active_cpumask;
-	if (err || !active)
-		goto out;
-
 	online_cpumask = scx_bpf_get_online_cpumask();
 	nr_cpus_onln = bpf_cpumask_weight(online_cpumask);
-	bpf_cpumask_copy(active, online_cpumask);
+	bpf_cpumask_copy(&active_cpumask, online_cpumask);
 	scx_bpf_put_cpumask(online_cpumask);
 
-	/*
-	 * Allocate the other cpumasks.
-	 */
-	err = calloc_cpumask(&ovrflw_cpumask);
-	if (err)
-		goto out;
+	bpf_cpumask_clear(&ovrflw_cpumask);
+	bpf_cpumask_clear(&turbo_cpumask);
+	bpf_cpumask_clear(&big_cpumask);
+	bpf_cpumask_clear(&steady_cpumask);
 
-	err = calloc_cpumask(&turbo_cpumask);
-	if (err)
-		goto out;
-
-	err = calloc_cpumask(&big_cpumask);
-	if (err)
-		goto out;
-
-	err = calloc_cpumask(&steady_cpumask);
-	if (err)
-		goto out;
-out:
 	bpf_rcu_read_unlock();
-	return err;
+	return 0;
 }
 
-static s32 init_per_cpu_ctx(u64 now)
+static __attribute__((noinline)) s32 init_per_cpu_ctx(u64 now)
 {
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *turbo, *big, *active, *ovrflw, *cd_cpumask;
@@ -2646,15 +2621,10 @@ static s32 init_per_cpu_ctx(u64 now)
 	/*
 	 * Prepare cpumasks.
 	 */
-	turbo = turbo_cpumask;
-	big = big_cpumask;
-	active  = active_cpumask;
-	ovrflw  = ovrflw_cpumask;
-	if (!turbo || !big || !active || !ovrflw) {
-		scx_bpf_error("Failed to prepare cpumasks.");
-		err = -ENOMEM;
-		goto unlock_out;
-	}
+	turbo = &turbo_cpumask;
+	big = &big_cpumask;
+	active  = &active_cpumask;
+	ovrflw  = &ovrflw_cpumask;
 
 	/*
 	 * Initialize CPU info
@@ -2670,18 +2640,6 @@ static s32 init_per_cpu_ctx(u64 now)
 			err = -ESRCH;
 			goto unlock_out;
 		}
-
-		err = calloc_cpumask(&cpuc->a_mask);
-		if (err)
-			goto unlock_out;
-
-		err = calloc_cpumask(&cpuc->o_mask);
-		if (err)
-			goto unlock_out;
-
-		err = calloc_cpumask(&cpuc->temp_mask);
-		if (err)
-			goto unlock_out;
 
 		cpuc->cpu_id = cpu;
 		cpuc->idle_start_clk = 0;
@@ -2815,7 +2773,7 @@ unlock_out:
 }
 
 
-static int init_per_cpu_dsqs(void)
+static __attribute__((noinline)) int init_per_cpu_dsqs(void)
 {
 	struct cpdom_ctx *cpdomc;
 	struct cpu_ctx *cpuc;
@@ -2851,6 +2809,7 @@ static int init_per_cpu_dsqs(void)
 	return 0;
 }
 
+#ifndef SCX_FCP_ANDROID_61
 s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_cgroup_init, struct cgroup *cgrp,
 			     struct scx_cgroup_init_args *args)
 {
@@ -2909,6 +2868,7 @@ void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
 	if (ret)
 	       scx_bpf_error("Failed to set bandwidth of a cgroup: %d", ret);
 }
+#endif /* !SCX_FCP_ANDROID_61 */
 
 int lavd_enqueue_cb(struct task_struct *p __arg_trusted, u64 ctx)
 {
@@ -3040,7 +3000,17 @@ int set_aggressive_migration(void)
 	    (cpdc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id])) &&
 	    READ_ONCE(cpdc->is_stealee)) {
 		set_task_flag(taskc, LAVD_FLAG_MIGRATION_AGGRESSIVE);
+#ifdef SCX_FCP_ANDROID_61
+		/*
+		 * This kernel has no kfunc hook for plain tracepoint
+		 * programs, so scx_bpf_kick_cpu() cannot be called from
+		 * here. The flag is still set and takes effect at the
+		 * task's next scheduling point.
+		 */
+		(void)cpu;
+#else
 		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+#endif
 	}
 	return 0;
 }

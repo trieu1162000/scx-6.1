@@ -206,9 +206,9 @@ bool is_perf_cri(task_ctx __arg_arena *taskc)
 __hidden
 const volatile u16 *get_cpu_order(void)
 {
-	int i = READ_ONCE(pco_idx);
+	u32 i = READ_ONCE(pco_idx);
 
-	if (i < 0 || i >= LAVD_PCO_STATE_MAX) {
+	if (i >= LAVD_PCO_STATE_MAX) {
 		scx_bpf_error("Incorrect PCO state: %d", i);
 		i = 0;
 	}
@@ -335,8 +335,7 @@ static int calc_nr_active_cpus(void)
 	return nr_cpu_ids;
 }
 
-__weak
-int do_core_compaction(void)
+static __always_inline int do_core_compaction(void)
 {
 	u32 sum_capacity = 0, big_capacity = 0, nr_active_cpdoms = 0;
 	struct bpf_cpumask *active, *ovrflw;
@@ -350,12 +349,8 @@ int do_core_compaction(void)
 	/*
 	 * Prepare cpumasks.
 	 */
-	active = active_cpumask;
-	ovrflw = ovrflw_cpumask;
-	if (!active || !ovrflw) {
-		scx_bpf_error("Failed to prepare cpumasks.");
-		goto unlock_out;
-	}
+	active = &active_cpumask;
+	ovrflw = &ovrflw_cpumask;
 
 	/*
 	 * Update the PCO index that meets the required compute capacity
@@ -484,7 +479,6 @@ int do_core_compaction(void)
 	 */
 	WRITE_ONCE(ovrflw_counted_active, false);
 
-unlock_out:
 	bpf_rcu_read_unlock();
 
 	return 0;
@@ -729,13 +723,8 @@ int reinit_active_cpumask_for_performance(void)
 	/*
 	 * Prepare cpumasks.
 	 */
-	active  = active_cpumask;
-	ovrflw  = ovrflw_cpumask;
-	if (!active || !ovrflw) {
-		scx_bpf_error("Failed to prepare cpumasks.");
-		err = -ENOMEM;
-		goto unlock_out;
-	}
+	active  = &active_cpumask;
+	ovrflw  = &ovrflw_cpumask;
 
 
 	/*
@@ -828,7 +817,6 @@ int reinit_active_cpumask_for_performance(void)
 	sys_stat.nr_active_cpdoms = nr_active_cpdoms;
 	pco_idx = nr_pco_states - 1;
 
-unlock_out:
 	bpf_rcu_read_unlock();
 	return err;
 }
@@ -1053,8 +1041,14 @@ static u64 read_schedutil_rate_limit_ns(s32 cpu)
  * When schedutil takes the CPU over, compute the target and void the last
  * send, so the next ops.running() sends it.
  */
-__hidden
-int update_cpufreq_rate_limit(struct cpu_ctx *cpuc)
+/*
+ * Inline form of update_cpufreq_rate_limit() for callers that are already
+ * part of the update_sys_stat() call chain. Keeping this out of a separate
+ * BPF subprogram saves a 64-byte verifier stack frame on the
+ * lavd_cpu_online() path.
+ */
+static __always_inline int
+__update_cpufreq_rate_limit(struct cpu_ctx *cpuc)
 {
 	u32 cpu = cpuc->cpu_id;
 	u64 old, new;
@@ -1072,6 +1066,12 @@ int update_cpufreq_rate_limit(struct cpu_ctx *cpuc)
 		WRITE_ONCE(cpuc->cpuperf_cur, LAVD_CPUPERF_UNSET);
 	}
 	return 0;
+}
+
+__hidden
+int update_cpufreq_rate_limit(struct cpu_ctx *cpuc)
+{
+	return __update_cpufreq_rate_limit(cpuc);
 }
 
 /*
@@ -1095,7 +1095,7 @@ int update_next_cpufreq_rate_limit(void)
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (cpuc) {
-		update_cpufreq_rate_limit(cpuc);
+		__update_cpufreq_rate_limit(cpuc);
 	}
 	return 0;
 }

@@ -115,7 +115,9 @@ int bpf_arena_reserve_pages(void *map, void __arena *ptr, __u32 page_cnt) __ksym
  * Note that cond_break can only be portably used in the body of a breakable
  * construct, whereas can_loop can be used anywhere.
  */
-#ifdef SCX_BPF_UNITTEST
+#if defined(SCX_BPF_UNITTEST) || defined(SCX_FCP_ANDROID_61)
+/* Android 6.1 lacks BPF may_goto (opcode 0xe5) entirely: fall back to
+ * plain, explicitly-bounded loops like the unit-test build does. */
 #define can_loop true
 #define __cond_break(expr) expr
 #else

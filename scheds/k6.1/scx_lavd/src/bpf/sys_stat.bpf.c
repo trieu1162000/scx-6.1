@@ -567,13 +567,11 @@ static void collect_sys_stat(void)
 		 * Update the global steady (non-turbulent) CPU mask.
 		 */
 		bpf_rcu_read_lock();
-		steady = steady_cpumask;
-		if (steady) {
-			if (cpuc->lat_headroom >= LAVD_LC_LATENCY_SENSITIVE_THRESH)
-				bpf_cpumask_set_cpu(cpu, steady);
-			else
-				bpf_cpumask_clear_cpu(cpu, steady);
-		}
+		steady = &steady_cpumask;
+		if (cpuc->lat_headroom >= LAVD_LC_LATENCY_SENSITIVE_THRESH)
+			bpf_cpumask_set_cpu(cpu, steady);
+		else
+			bpf_cpumask_clear_cpu(cpu, steady);
 
 		/*
 		 * Repair idle hints: a busy CPU loses its bit (bypass mode

@@ -20,6 +20,7 @@ Status: experimental. Tested on:
 | `scheds/k6.1/scx_p2dq` | `scx_p2dq_k61` — P2DQ ported to 6.1 |
 | `scheds/rust/scx_fcp` | `scx_fcp` — frame critical-path scheduler (vendored) |
 | `scheds/k6.1/include` | 6.1 sched_ext/BPF compatibility headers |
+| `scheds/include/vmlinux` | `vmlinux.h` generated from the 6.1 backport kernel |
 | `kernel/` | Kernel-side backport patch and notes |
 | `rust/scx_utils` | Shared userspace library, with 6.1 runtime fixes |
 
@@ -47,17 +48,49 @@ CONFIG_IKCONFIG_PROC=y         # optional, lets /proc/config.gz verify the above
 
 `CONFIG_DYNAMIC_FTRACE` follows `CONFIG_FUNCTION_TRACER` (`default y`).
 
-### BTF and pahole
+### vmlinux.h, ABI tables, and the 6.1 API gap
 
-`CONFIG_DEBUG_INFO_BTF` requires pahole at kernel build time. pahole 1.23
-(used by some Android 14 prebuilts) does not emit `BTF_KIND_ENUM64`, so
-64-bit sched_ext enumerators are truncated in `/sys/kernel/btf/vmlinux`.
+The reference backport workflow (`sched-ext/scx-backports`) replaces the
+build's `vmlinux.h` with one generated from the target kernel. This tree
+generates that header into `scheds/include/vmlinux/vmlinux-6.1-<arch>.h`
+and uses it as the source of truth for the enum ABI tables:
 
-The 6.1 binaries select the `Linux61` enum ABI through
-`scx_utils::compat::set_enum_abi()` and recover the values from
-`rust/scx_utils/src/enums_abi.k61.rs`. The scheduler logs a warning once;
-this is expected with pahole 1.23. pahole >= 1.24 removes the warning and
-is recommended for new kernels.
+- `scheds/k6.1/include/scx/enum_defs.autogen.h`
+- `scheds/k6.1/include/scx/enums_abi.autogen.h`
+- `rust/scx_utils/src/enums_abi.autogen.rs`
+
+The tables are generated from the 6.1 header with `scripts/gen_enum_defs.py`,
+so the runtime enum values (`read_enum`, rodata) are the 6.1 values.
+
+The BPF **compile** still uses the bundled upstream `vmlinux.h` for type
+definitions. The 6.1 backport does not provide several newer types that the
+scx BPF headers use unconditionally: `bpf_iter_bits`, `bpf_iter_scx_dsq`,
+`scx_bpf_select_cpu_and_args`, the arena `scx_cmask`, `SCX_PICK_IDLE_CORE`,
+`SCX_WAKE_SYNC`, `SCX_ECODE_ACT_RESTART`, and others. Swapping the compile
+header therefore requires porting those headers to the 6.1 API first; that
+is a separate, larger change. Until then this split keeps the ABI correct
+without a BPF rewrite.
+
+To regenerate the header for another kernel or architecture:
+
+```sh
+# From an ELF vmlinux (with .BTF) or a raw BTF blob:
+scripts/gen-vmlinux-6.1.sh /path/to/vmlinux x86_64
+scripts/gen-vmlinux-6.1.sh /tmp/vmlinux-6.1.btf arm64
+
+# Then regenerate the tables:
+python3 scripts/gen_enum_defs.py \
+  scheds/include/vmlinux/vmlinux-6.1-arm64.h \
+  scheds/k6.1/include/scx/enum_defs.autogen.h \
+  scheds/k6.1/include/scx/enums_abi.autogen.h \
+  rust/scx_utils/src/enums_abi.autogen.rs
+```
+
+If the source kernel was built with pahole < 1.24, its BTF has no
+`BTF_KIND_ENUM64` and 64-bit sched_ext enums are truncated.
+`gen-vmlinux-6.1.sh` detects this and repairs the known enumerators from the
+6.1 source before writing the header. pahole >= 1.24 avoids the repair
+entirely and is recommended for new kernels.
 
 ## Build
 
@@ -72,13 +105,12 @@ Rust: latest stable (the vendored `scx_fcp` uses edition 2026).
 Native build (x86_64 host, useful as a smoke test):
 
 ```sh
-cargo build --release -p scx_lavd_k61 -p scx_p2dq_k61 -p scx_fcp
+./scripts/build-6.1.sh
 ```
 
 Cross build for an arm64 device:
 
 ```sh
-# Static arm64 libs used by libbpf: libelf.a, libz.a, libzstd.a
 export ARM64_LIBS=$HOME/opt/arm64-libs
 
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \

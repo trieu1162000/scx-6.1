@@ -22,8 +22,6 @@ use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::slice::from_raw_parts;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
 
 const PROCFS_MOUNTS: &str = "/proc/mounts";
 const TRACEFS: &str = "tracefs";
@@ -31,41 +29,6 @@ const DEBUGFS: &str = "debugfs";
 
 mod enums_abi {
     include!("enums_abi.autogen.rs");
-}
-
-mod enums_abi_k61 {
-    include!("enums_abi.k61.rs");
-}
-
-/// Kernel enum ABI used to recover truncated 64-bit enumerators.
-///
-/// The default is the bundled upstream vmlinux.h. Only binaries built for the
-/// Linux 6.1 sched_ext backport opt into [`EnumAbi::Linux61`], through
-/// [`set_enum_abi`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum EnumAbi {
-    Upstream = 0,
-    Linux61 = 1,
-}
-
-static ENUM_ABI: AtomicU8 = AtomicU8::new(EnumAbi::Upstream as u8);
-
-/// Select the kernel enum ABI for this process.
-///
-/// Must be called before the first enum is read — in practice, before the BPF
-/// skeleton is opened. Later calls do not affect values that were already
-/// cached by `scx_enums` or the `compat` statics.
-pub fn set_enum_abi(abi: EnumAbi) {
-    ENUM_ABI.store(abi as u8, Ordering::Relaxed);
-}
-
-fn enum_abi() -> EnumAbi {
-    if ENUM_ABI.load(Ordering::Relaxed) == EnumAbi::Linux61 as u8 {
-        EnumAbi::Linux61
-    } else {
-        EnumAbi::Upstream
-    }
 }
 
 lazy_static::lazy_static! {
@@ -227,25 +190,19 @@ fn recover_truncated_enum64_from(
              pahole < 1.24 or with --skip_encoding_btf_enum64), so 64-bit \
              scx enum values are truncated to their low 32 bits in kernel \
              BTF. Substituting the full 64-bit values from the ABI table \
-             this binary was built with (the upstream vmlinux.h, or the \
-             selected Linux 6.1 table), cross-checked against the low 32 \
-             bits the kernel does provide. The high 32 bits cannot be \
-             verified: if the running kernel's actual values differ from \
-             the build-time ABI table (e.g. an enum that moved in a newer \
-             kernel), the scheduler will operate on bogus values, such as \
-             dispatching to nonexistent DSQ ids, and can wildly malfunction."
+             generated from the vmlinux.h this tree was built against, \
+             cross-checked against the low 32 bits the kernel does provide. \
+             The high 32 bits cannot be verified: if the running kernel's \
+             actual values differ from the build-time vmlinux.h (e.g. an \
+             enum that moved in a newer kernel), the scheduler will operate \
+             on bogus values, such as dispatching to nonexistent DSQ ids, \
+             and can wildly malfunction."
         );
     });
     Ok(abi_val)
 }
 
 fn recover_truncated_enum64(type_name: &str, name: &str, lo32: u32) -> Result<u64> {
-    if enum_abi() == EnumAbi::Linux61 {
-        let overrides = enums_abi_k61::ENUM_ABI_OVERRIDES_K61;
-        if overrides.iter().any(|(t, n, _)| *t == type_name && *n == name) {
-            return recover_truncated_enum64_from(overrides, type_name, name, lo32);
-        }
-    }
     recover_truncated_enum64_from(enums_abi::ENUM_ABI_VALUES, type_name, name, lo32)
 }
 
@@ -1290,38 +1247,6 @@ mod tests {
         // Unknown enumerators fail pessimistically (stale autogen table).
         assert!(
             super::recover_truncated_enum64_from(table, "scx_enq_flags", "SCX_ENQ_NEW", 7).is_err()
-        );
-    }
-
-    #[test]
-    fn test_recover_truncated_enum64_k61() {
-        let overrides = super::enums_abi_k61::ENUM_ABI_OVERRIDES_K61;
-
-        // The 6.1 backport defines SCX_ENQ_BLOCKED as 1 << 36, while the
-        // bundled upstream vmlinux.h has 1 << 42.
-        assert_eq!(
-            super::recover_truncated_enum64_from(overrides, "scx_enq_flags", "SCX_ENQ_BLOCKED", 0)
-                .unwrap(),
-            0x1000000000
-        );
-        // Only enumerators known to differ are overridden.
-        assert!(
-            super::recover_truncated_enum64_from(overrides, "scx_enq_flags", "SCX_ENQ_PREEMPT", 0)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn test_enum_abi_dispatch() {
-        super::set_enum_abi(super::EnumAbi::Linux61);
-        assert_eq!(
-            super::recover_truncated_enum64("scx_enq_flags", "SCX_ENQ_BLOCKED", 0).unwrap(),
-            0x1000000000
-        );
-        super::set_enum_abi(super::EnumAbi::Upstream);
-        assert_eq!(
-            super::recover_truncated_enum64("scx_enq_flags", "SCX_ENQ_BLOCKED", 0).unwrap(),
-            0x40000000000
         );
     }
 

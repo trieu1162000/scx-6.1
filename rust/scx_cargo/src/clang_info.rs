@@ -160,7 +160,9 @@ impl ClangInfo {
             .map(|x| x.into())
             .collect();
         cflags.push(format!("-D__TARGET_ARCH_{}", kernel_target));
-        cflags.push("-mcpu=v4".into());
+        // The 6.1 target does not understand the v4 ISA (32-bit signed
+        // jumps and friends); the verifier rejects those opcodes outright.
+        cflags.push("-mcpu=v3".into());
         // Two v4 lowerings outrun the kernel baseline and stay off until the
         // minimum supported kernel reaches the release that added them.
         //

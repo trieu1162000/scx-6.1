@@ -1,3 +1,0 @@
-[submodule "scheds/rust/scx_fcp"]
-	path = scheds/rust/scx_fcp
-	url = git@github.com:trieu1162000/scx_fcp.git

@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 
 fn main() {
-    // Temporarily support for backport scx in K6.1
-    // TODO: Revert deb6870
+    // This package lives in the 6.1 backport tree. The define selects the
+    // 6.1 compatibility branches in the BPF headers and the legacy dispatch
+    // path in main.bpf.c.
     let mut bpf_cflags =
         std::env::var("BPF_EXTRA_CFLAGS_POST_INCL").unwrap_or_else(|_| "-mcpu=v3".to_owned());
-    if std::env::var_os("SCX_FCP_ANDROID_61").is_some() {
-        bpf_cflags.push_str(" -DSCX_FCP_ANDROID_61");
-    }
+    bpf_cflags.push_str(" -DSCX_FCP_ANDROID_61");
 
     let profile = std::env::var("SCX_FCP_BUILD").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=SCX_FCP_BUILD");

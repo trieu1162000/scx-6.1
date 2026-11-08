@@ -92,7 +92,7 @@ kill_stale() {
         pid=$(sh_ "pidof $name" | tr -d '\r')
         [ -n "$pid" ] && sh_ "kill -15 $pid" >/dev/null 2>&1 || true
     done
-    pids=$(sh_ "ps -A -o PID,ARGS | awk '/data\\/local\\/tmp\\/scx\\/scx_/ {print \\$1}'" | tr -d '\r')
+    pids=$(sh_ "ps -A -o PID,ARGS | awk '/scx_fcp|scx_lavd|scx_p2dq/ {print \\$1}'" | tr -d '\r')
     for pid in $pids; do
         sh_ "kill -15 $pid" >/dev/null 2>&1 || true
     done

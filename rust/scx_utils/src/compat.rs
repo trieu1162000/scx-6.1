@@ -1087,7 +1087,12 @@ macro_rules! __scx_ops_load {
             }
 
             if !scx_utils::compat::function_tracer_available() {
-                break 'block Err(anyhow::anyhow!("kernel is missing CONFIG_FUNCTION_TRACER"));
+                ::scx_utils::warn!("CONFIG_FUNCTION_TRACER is disabled; skipping tracing programs");
+                for mut prog in $skel.open_object_mut().progs_mut() {
+                    if prog.prog_type() == ::libbpf_rs::ProgramType::Tracing {
+                        prog.set_autoload(false);
+                    }
+                }
             }
 
             scx_utils::uei_set_size!($skel, $ops, $uei);

@@ -93,10 +93,20 @@ If the source kernel was built with pahole < 1.24, its BTF has no
 entirely and is recommended for new kernels.
 
 ## Build
+bpftool (required for gen-vmlinux-6.1.sh) (optional if not existed in apt package):
+```sh
+cd <aosp_top_dir>/external/bpftool
+ln -s ../libbpf libbpf
+cd src/
+PATH=/usr/bin:/bin CC="gcc-13" make -j64
+```
 
 Host dependencies:
 
 ```sh
+sudo apt update
+# For cross-compile for arm64
+sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 sudo apt install clang libelf-dev zlib1g-dev libzstd-dev pkg-config
 ```
 

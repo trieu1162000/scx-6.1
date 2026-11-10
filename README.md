@@ -18,7 +18,7 @@ Status: experimental. Tested on:
 |---|---|
 | `scheds/k6.1/scx_lavd` | `scx_lavd_k61` — LAVD ported to 6.1 |
 | `scheds/k6.1/scx_p2dq` | `scx_p2dq_k61` — P2DQ ported to 6.1 |
-| `scheds/rust/scx_fcp` | `scx_fcp` — frame critical-path scheduler (vendored) |
+| `scheds/rust/scx_fcp` | `scx_fcp` — tuned frame-context scheduler, ported to the 6.1 ABI |
 | `scheds/k6.1/include` | 6.1 sched_ext/BPF compatibility headers |
 | `scheds/include/vmlinux` | `vmlinux.h` generated from the 6.1 backport kernel |
 | `kernel/` | Kernel-side backport patch and notes |
@@ -93,20 +93,41 @@ If the source kernel was built with pahole < 1.24, its BTF has no
 entirely and is recommended for new kernels.
 
 ## Build
+bpftool (required for gen-vmlinux-6.1.sh) (optional if not existed in apt package):
+```sh
+cd <aosp_top_dir>/external/bpftool
+ln -s ../libbpf libbpf
+cd src/
+PATH=/usr/bin:/bin CC="gcc-13" make -j64
+```
 
 Host dependencies:
 
 ```sh
+sudo apt update
+# For cross-compile for arm64
+sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 sudo apt install clang libelf-dev zlib1g-dev libzstd-dev pkg-config
 ```
 
-Rust: latest stable (the vendored `scx_fcp` uses edition 2026).
+Rust: latest stable (`scx_fcp` uses edition 2024).
 
 Native build (x86_64 host, useful as a smoke test):
 
 ```sh
 ./scripts/build-6.1.sh
 ```
+
+Build only the `scx_fcp` profiles and the synthetic benchmark:
+
+```sh
+./scripts/build-6.1-fcp.sh
+```
+
+The scheduler-specific 6.1 differences, build, and test commands are in
+[`scheds/rust/scx_fcp/README.md`](scheds/rust/scx_fcp/README.md) and
+[`tests/README.md`](tests/README.md). The common scheduler design is documented
+upstream in the separate `scx_fcp` tree.
 
 Cross build for an arm64 device:
 
@@ -121,7 +142,15 @@ cargo build --release --target aarch64-unknown-linux-gnu \
   -p scx_lavd_k61 -p scx_p2dq_k61 -p scx_fcp
 ```
 
-Binaries land in `target/<target-triple>/release/`.
+For the `scx_fcp` profiles, the helper accepts the same target and CC:
+
+```sh
+TARGET=aarch64-unknown-linux-gnu CC=aarch64-linux-gnu-gcc \
+  ./scripts/build-6.1-fcp.sh
+```
+
+Binaries land in `target/<target-triple>/release/`, or in
+`build/6.1-fcp/bin` when the helper is used.
 
 ## Run
 
@@ -164,7 +193,7 @@ The state file is root-only on Android, hence `su 0`.
 The 6.1 changes are confined to:
 
 - `scheds/k6.1/`
-- `scheds/rust/scx_fcp/` (vendored; upstream is a separate repository)
+- `scheds/rust/scx_fcp/` (ported to the 6.1 ABI; upstream is a separate repository)
 - `rust/scx_utils/` and `rust/scx_cargo/` compatibility code
 - `kernel/`
 

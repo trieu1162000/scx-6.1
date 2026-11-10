@@ -1,162 +1,125 @@
-# scx_fcp Setup, Build, and Evaluation Guide
+# scx_fcp setup on Linux 6.1
 
-This guide provides step-by-step instructions to build `scx_fcp`, configure Linux/Android GKI kernels (`6.18` LTS and `7.2` mainline), package self-contained Android bundles (`x86_64` and `aarch64`), and run benchmarks on Linux hosts, 32-vCPU Android Cuttlefish, Car Emulator, and physical ARM64 Android devices.
+This guide covers only the 6.1-specific build, kernel, device, and test steps.
+Common host prerequisites and the scheduler options are documented in the
+mainline `scx_fcp` tree.
 
----
+## 1. Build
 
-## 1. Host Prerequisites & Building `scx_fcp`
-
-### 1.1. Toolchain Requirements
-- **Rust toolchain**: `cargo` / `rustc` (1.82+)
-- **Clang / LLVM**: `clang` 17+ (`clang` 22+ recommended for mainline kernels) with `llvm` and `bpftool`
-- **Libraries**: `libelf-dev`, `zlib1g-dev`, `libzstd-dev`, `pkg-config`
-- **Cross-compilation (for ARM64 Android devices)**: `gcc-aarch64-linux-gnu`, `libc6-dev-arm64-cross`
-
-### 1.2. Build `scx_fcp` and `fcp_frame_bench` (x86_64 & aarch64)
+The 6.1 tree builds the scheduler against the vendored 6.1 ABI tables. Build
+the tuned profiles and the synthetic benchmark with:
 
 ```bash
-cd /home/worker/workspace/scx
-export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
-
-# 1. Build x86_64 release binaries (for Linux host, Cuttlefish, and x86_64 Android Emulator)
-cargo build --release -p scx_fcp -p scx_lavd -p scx_p2dq
-make -C tools/scx_fcp_bench
-
-# 2. Cross-compile aarch64 release binaries (for physical ARM64 Android devices)
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-  cargo build --release --target aarch64-unknown-linux-gnu -p scx_fcp -p scx_lavd -p scx_p2dq
-aarch64-linux-gnu-gcc -O2 -pthread tools/scx_fcp_bench/fcp_frame_bench.c \
-  -o tools/scx_fcp_bench/fcp_frame_bench_aarch64 -lm
+cd /path/to/scx-6.1
+./scripts/build-6.1-fcp.sh
 ```
 
----
+Outputs:
 
-## 2. Kernel Configuration Requirements
+```text
+build/6.1-fcp/bin/scx_fcp
+build/6.1-fcp/bin/scx_fcp_named
+build/6.1-fcp/bin/scx_fcp_behavioral
+build/6.1-fcp/bin/fcp_frame_bench
+```
 
-To run `scx_fcp`, the target kernel must be built with `sched_ext` and BTF enabled (`pahole >= 1.22` in `PATH` during kernel build):
+Add the 6.1 baselines with `BUILD_BASELINES=1`. They are installed as
+`scx_lavd` and `scx_p2dq`, backed by `scx_lavd_k61` and `scx_p2dq_k61`.
+
+For an ARM64 device, set the cross linker and target. The top-level README
+has the static `RUSTFLAGS` and `ARM64_LIBS` recipe; the helper accepts the
+target and C compiler:
+
+```bash
+TARGET=aarch64-unknown-linux-gnu CC=aarch64-linux-gnu-gcc \
+  ./scripts/build-6.1-fcp.sh
+```
+
+Do not set `SCX_FCP_ANDROID_61` manually. `build.rs` defines it for this tree;
+without it the 6.1 compatibility branches and dispatch path are not selected.
+
+## 2. Kernel
+
+The target kernel must carry the backport patch in `kernel/`. Apply it to the
+kernel tree that produces the running image:
+
+```bash
+git am /path/to/scx-6.1/kernel/0001-scx-6.1-minimal-backport.patch
+```
+
+Required config and pahole/BTF notes are in [`kernel/README.md`](../../../kernel/README.md).
+At minimum:
 
 ```text
 CONFIG_BPF=y
 CONFIG_BPF_SYSCALL=y
 CONFIG_BPF_JIT=y
+CONFIG_BPF_JIT_ALWAYS_ON=y
+CONFIG_BPF_JIT_DEFAULT_ON=y
 CONFIG_DEBUG_INFO_BTF=y
 CONFIG_SCHED_CLASS_EXT=y
-CONFIG_EXT_GROUP_SCHED=y
-# On Android GKI kernels (android17-6.18 / android-mainline), disable Proxy Execution:
-# CONFIG_SCHED_PROXY_EXEC is not set
+CONFIG_KALLSYMS_ALL=y
+CONFIG_IKCONFIG_PROC=y
 ```
 
-- **Why `CONFIG_SCHED_PROXY_EXEC=n` is required on Android GKI**: Android's Proxy Execution splits `rq->curr` and `rq->donor` across mutex wait chains, which conflicts with `sched_ext` dispatch queues (and is marked `depends on !SCHED_CLASS_EXT` in `android-mainline` `init/Kconfig`).
-- **`CONFIG_FUNCTION_TRACER` is optional**: `scx_fcp` attaches purely via `BPF_PROG_TYPE_STRUCT_OPS` (`sched_ext_ops`) and does not require tracefs `available_filter_functions`.
+The backport hooks the CFS path, so 6.1 results are a separate set from
+mainline sched_ext results.
 
----
+## 3. SA8155P Android 14 device
 
-## 3. Packaging Self-Contained Bundles for Android Guests/Devices
+Stage the scheduler and benchmark under `/data/local/tmp/scx`; use `su 0` on
+the device. SELinux must be permissive on the test image.
 
-Because Android uses Bionic (`libc.so`) while standard Rust builds link against `glibc`, `libelf`, and `libz`, package the shared libraries alongside `ld-linux` into `/data/local/tmp/scx`:
-
-### 3.1. `x86_64` Android Bundle (Cuttlefish / Android Emulator)
 ```bash
-mkdir -p /tmp/scx_x86_64_bundle/lib
-cp -f target/release/scx_fcp target/release/scx_lavd target/release/scx_p2dq \
-      tools/scx_fcp_bench/fcp_frame_bench /tmp/scx_x86_64_bundle/
-cp -L /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
-      /lib/x86_64-linux-gnu/libc.so.6 \
-      /lib/x86_64-linux-gnu/libm.so.6 \
-      /lib/x86_64-linux-gnu/libgcc_s.so.1 \
-      /lib/x86_64-linux-gnu/libelf.so.1 \
-      /lib/x86_64-linux-gnu/libz.so.1 \
-      /lib/x86_64-linux-gnu/libzstd.so.1 \
-      /tmp/scx_x86_64_bundle/lib/
-```
-
-### 3.2. `aarch64` Android Bundle (Physical ARM64 Devices)
-```bash
-mkdir -p /tmp/scx_aarch64_bundle/lib
-cp -f target/aarch64-unknown-linux-gnu/release/scx_fcp \
-      target/aarch64-unknown-linux-gnu/release/scx_lavd \
-      target/aarch64-unknown-linux-gnu/release/scx_p2dq \
-      /tmp/scx_aarch64_bundle/
-cp -f tools/scx_fcp_bench/fcp_frame_bench_aarch64 /tmp/scx_aarch64_bundle/fcp_frame_bench
-cp -L /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 \
-      /usr/aarch64-linux-gnu/lib/libc.so.6 \
-      /usr/aarch64-linux-gnu/lib/libm.so.6 \
-      /usr/aarch64-linux-gnu/lib/libgcc_s.so.1 \
-      /usr/aarch64-linux-gnu/lib/libelf.so.1 \
-      /usr/aarch64-linux-gnu/lib/libz.so.1 \
-      /tmp/scx_aarch64_bundle/lib/
-```
-
----
-
-## 4. Running `scx_fcp` and Benchmarks
-
-### 4.1. On a Standard Linux Host
-```bash
-# Attach scx_fcp with 60Hz (16667us) frame budget and 2s telemetry interval
-sudo ./target/release/scx_fcp -f 16667 -c 2000 -i 3000 -b 6000 -t 850 -s 2
-
-# In another terminal, verify sched_ext state and run fcp_frame_bench
-cat /sys/kernel/sched_ext/state
-cat /sys/kernel/sched_ext/root/ops
-./tools/scx_fcp_bench/fcp_frame_bench --scheduler scx_fcp --frames 300 --hz 60 --stages 4 --stage-us 1800 --bg-workers 16
-```
-
-### 4.2. On 32-vCPU Android Cuttlefish (`x86_64`)
-```bash
-adb -s 127.0.0.1:6520 push /tmp/scx_x86_64_bundle /data/local/tmp/scx
-
-# Start scx_fcp in background
-adb -s 127.0.0.1:6520 shell 'su 0 sh -c "
-  chmod 755 /data/local/tmp/scx/scx_* /data/local/tmp/scx/fcp_frame_bench /data/local/tmp/scx/lib/*
-  setenforce 0
+adb -s "$SERIAL" push build/6.1-fcp/bin/. /data/local/tmp/scx/
+adb -s "$SERIAL" shell 'su 0 chmod 755 /data/local/tmp/scx/scx_* /data/local/tmp/scx/fcp_frame_bench'
+adb -s "$SERIAL" shell 'su 0 setenforce 0'
+adb -s "$SERIAL" shell 'su 0 sh -c "
   ulimit -l unlimited
-  nohup /data/local/tmp/scx/lib/ld-linux-x86-64.so.2 --library-path /data/local/tmp/scx/lib \
-    /data/local/tmp/scx/scx_fcp -f 16667 -s 2 > /data/local/tmp/scx_fcp.log 2>&1 < /dev/null &
-"'
-
-# Verify and run 90Hz 4-stage pipeline benchmark
-adb -s 127.0.0.1:6520 shell 'su 0 sh -c "
-  cat /sys/kernel/sched_ext/state
-  cat /sys/kernel/sched_ext/root/ops
-  /data/local/tmp/scx/lib/ld-linux-x86-64.so.2 --library-path /data/local/tmp/scx/lib \
-    /data/local/tmp/scx/fcp_frame_bench --scheduler scx_fcp --frames 300 --hz 90 --stages 4 --stage-us 1800 --bg-workers 24
-  tail -n 5 /data/local/tmp/scx_fcp.log
-"'
+  SCX_STATS_BASE_PATH=/data/local/tmp/scx/stats \
+    nohup /data/local/tmp/scx/scx_fcp -f 16667 -s 2 \
+    > /data/local/tmp/scx_fcp.log 2>&1 < /dev/null &"'
 ```
 
-### 4.3. On Physical ARM64 Android Device (`aarch64`)
-```bash
-adb push /tmp/scx_aarch64_bundle /data/local/tmp/scx
-
-adb shell 'su 0 sh -c "
-  chmod 755 /data/local/tmp/scx/scx_* /data/local/tmp/scx/fcp_frame_bench /data/local/tmp/scx/lib/*
-  setenforce 0
-  ulimit -l unlimited
-  nohup /data/local/tmp/scx/lib/ld-linux-aarch64.so.1 --library-path /data/local/tmp/scx/lib \
-    /data/local/tmp/scx/scx_fcp -f 16667 -s 2 > /data/local/tmp/scx_fcp.log 2>&1 < /dev/null &
-"'
-
-adb shell 'su 0 sh -c "
-  cat /sys/kernel/sched_ext/state
-  cat /sys/kernel/sched_ext/root/ops
-  tail -n 10 /data/local/tmp/scx_fcp.log
-"'
-```
-
----
-
-## 5. Collecting Kernel eBPF Execution Overhead (`bpf_stats_enabled`)
-
-To measure exact per-callback eBPF execution latency (`ns/call`) and total CPU time (`s`) for any `sched_ext` scheduler:
+Verify the attach:
 
 ```bash
-# Enable kernel BPF runtime statistics before running a benchmark
-adb shell 'su 0 sysctl -w kernel.bpf_stats_enabled=1'
-
-# Inspect run_time_ns and run_cnt across all attached struct_ops programs of the scheduler PID
-adb shell 'su 0 sh -c "
-  PID=\$(pgrep -f scx_fcp | head -n 1)
-  grep -H -E \"prog_id|run_time_ns|run_cnt\" /proc/\$PID/fdinfo/* 2>/dev/null
-"'
+adb -s "$SERIAL" shell 'su 0 cat /sys/kernel/sched_ext/state'
+adb -s "$SERIAL" shell 'su 0 cat /sys/kernel/sched_ext/root/ops'
 ```
+
+The expected ops name is `fcp` for the default tuned profile, `fcp_nh` for
+named, and `fcp_zh` for behavioral.
+
+## 4. Tests
+
+The test harnesses are shared with the mainline tree and adapted for the 6.1
+binary names. From the `scx-6.1` root:
+
+```bash
+BIN_DIR=build/6.1-fcp/bin \
+  tests/jankbench/run_jankbench.sh -p scx_fcp -n 1
+
+BIN_DIR=build/6.1-fcp/bin \
+  tests/uibench/run_uibench.sh -p scx_fcp -n 1 -r 3
+
+BIN_DIR=build/6.1-fcp/bin SCHEDULER_LABEL=scx_fcp \
+  tests/synthetic/run_fcp_frame_bench.sh
+```
+
+JankBench and UiBench need the workload APKs on the device; see
+[`tests/README.md`](../../../tests/README.md). The test policy names map
+`scx_lavd` to `scx_lavd_k61` and `scx_p2dq` to `scx_p2dq_k61`.
+
+## 5. Cleanup and caveat
+
+Stop the scheduler and verify the state:
+
+```bash
+adb -s "$SERIAL" shell 'su 0 pkill -f /data/local/tmp/scx/scx_fcp'
+adb -s "$SERIAL" shell 'su 0 cat /sys/kernel/sched_ext/state'
+```
+
+If a scheduler is killed with `SIGKILL`, the 6.1 backport can leave
+`/sys/kernel/sched_ext/state` at `enabled`. Reboot the device before switching
+schedulers or starting a new policy block.

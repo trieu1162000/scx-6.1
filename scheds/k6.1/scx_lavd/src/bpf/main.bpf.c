@@ -2093,7 +2093,6 @@ void BPF_STRUCT_OPS(lavd_cpu_online, s32 cpu)
 	__sync_fetch_and_add(&nr_cpus_onln, 1);
 	__sync_fetch_and_add(&total_max_capacity, cpuc->max_capacity);
 	update_autopilot_high_cap();
-	update_sys_stat();
 }
 
 void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
@@ -2115,9 +2114,9 @@ void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
 	__sync_fetch_and_sub(&nr_cpus_onln, 1);
 	__sync_fetch_and_sub(&total_max_capacity, cpuc->max_capacity);
 	update_autopilot_high_cap();
-	update_sys_stat();
 }
 
+#ifndef SCX_FCP_ANDROID_61
 void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
 {
 	/*
@@ -2206,6 +2205,7 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
 		}
 	}
 }
+#endif
 
 void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 		    const struct cpumask *cpumask)
@@ -3043,7 +3043,9 @@ SCX_OPS_DEFINE(lavd_ops,
 	       .quiescent		= (void *)lavd_quiescent,
 	       .cpu_online		= (void *)lavd_cpu_online,
 	       .cpu_offline		= (void *)lavd_cpu_offline,
+#ifndef SCX_FCP_ANDROID_61
 	       .update_idle		= (void *)lavd_update_idle,
+#endif
 	       .set_cpumask		= (void *)lavd_set_cpumask,
 	       .cpu_release		= (void *)lavd_cpu_release,
 	       .enable			= (void *)lavd_enable,

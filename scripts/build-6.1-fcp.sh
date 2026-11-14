@@ -40,7 +40,7 @@ build_profile() {
     echo "build $name${TARGET:+ for $TARGET}"
     (
         cd "$ROOT"
-        SCX_FCP_BUILD=$profile cargo build "${CARGO_ARGS[@]}"
+        env -u CC SCX_FCP_BUILD=\$profile cargo build "${CARGO_ARGS[@]}"
     ) >"$log" 2>&1 || {
         echo "build failed; see $log" >&2
         exit 1
@@ -56,7 +56,7 @@ if [ "${BUILD_BASELINES:-0}" = 1 ]; then
     echo "build 6.1 baselines"
     (
         cd "$ROOT"
-        cargo build --release -p scx_lavd_k61 -p scx_p2dq_k61 "${CARGO_ARGS[@]:2}"
+        env -u CC cargo build --release -p scx_lavd_k61 -p scx_p2dq_k61 "${CARGO_ARGS[@]:2}"
     ) >"$LOG_DIR/build-baselines.log" 2>&1 || {
         echo "baseline build failed; see $LOG_DIR/build-baselines.log" >&2
         exit 1

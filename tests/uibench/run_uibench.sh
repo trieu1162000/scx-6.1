@@ -81,7 +81,7 @@ TESTS=(
     "shadow-grid-list|com.android.uibench.janktests.UiBenchRenderingJankTests#testShadowGridListFling"
     "inflating-list|com.android.uibench.janktests.UiBenchJankTests#testInflatingListViewFling"
     "slow-bind-recycler|com.android.uibench.janktests.UiBenchJankTests#testSlowBindRecyclerViewFling"
-    "trivial-recycler|com.android.uibench.janktests.UiBenchJankTests#testTrivialRecyclerViewFling"
+    "trivial-recycler|com.android.uibench.janktests.UiBenchJankTests#testTrivialRecyclerListViewFling"
     "layout-cache-low|com.android.uibench.janktests.UiBenchTextJankTests#testLayoutCacheLowHitrateFling"
 )
 

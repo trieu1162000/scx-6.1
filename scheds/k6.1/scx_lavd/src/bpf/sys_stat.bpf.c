@@ -848,6 +848,7 @@ int update_sys_stat(void)
 	return 0;
 }
 
+#ifndef SCX_FCP_ANDROID_61
 static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 {
 	int err;
@@ -860,15 +861,18 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 
 	return 0;
 }
+#endif
 
 __weak
 s32 init_sys_stat(u64 now)
 {
 	struct cpdom_ctx *cpdomc;
-	struct bpf_timer *timer;
 	u64 cpdom_id;
+#ifndef SCX_FCP_ANDROID_61
+	struct bpf_timer *timer;
 	u32 key = 0;
 	int err;
+#endif
 
 	sys_stat.last_update_clk = now;
 	sys_stat.nr_active = nr_cpus_onln;
@@ -882,6 +886,7 @@ s32 init_sys_stat(u64 now)
 			sys_stat.nr_active_cpdoms++;
 	}
 
+#ifndef SCX_FCP_ANDROID_61
 	timer = bpf_map_lookup_elem(&update_timer, &key);
 	if (!timer) {
 		scx_bpf_error("Failed to lookup update timer");
@@ -894,6 +899,7 @@ s32 init_sys_stat(u64 now)
 		scx_bpf_error("Failed to arm update timer");
 		return err;
 	}
+#endif
 
 	return 0;
 }

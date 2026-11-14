@@ -1086,8 +1086,23 @@ macro_rules! __scx_ops_load {
                 }
             }
 
-            if !scx_utils::compat::function_tracer_available() {
-                ::scx_utils::warn!("CONFIG_FUNCTION_TRACER is disabled; skipping tracing programs");
+            let pre_6_7_struct_ops = matches!(
+                scx_utils::compat::struct_has_field("sched_ext_ops", "sub_attach"),
+                Ok(false) | Err(_)
+            );
+            if pre_6_7_struct_ops {
+                use ::libbpf_rs::AsRawLibbpf;
+                unsafe {
+                    let _ = ::libbpf_rs::libbpf_sys::bpf_map__set_map_flags(
+                        $skel.maps.$ops.as_libbpf_object().as_ptr(),
+                        0,
+                    );
+                }
+            }
+            if !scx_utils::compat::function_tracer_available()
+                || (cfg!(target_arch = "aarch64") && pre_6_7_struct_ops)
+            {
+                ::scx_utils::warn!("BPF fentry/fexit trampolines unavailable; skipping tracing programs");
                 for mut prog in $skel.open_object_mut().progs_mut() {
                     if prog.prog_type() == ::libbpf_rs::ProgramType::Tracing {
                         prog.set_autoload(false);
@@ -1189,16 +1204,16 @@ macro_rules! scx_ops_attach {
                 "another sched_ext scheduler is already running"
             ));
         }
+        if let Err(err) = $skel.attach() {
+            ::scx_utils::warn!(
+                "non-struct_ops BPF attach unsupported ({err}); continuing with struct_ops attach"
+            );
+        }
         $skel
-            .attach()
-            .context("Failed to attach non-struct_ops BPF programs")
-            .and_then(|_| {
-                $skel
-                    .maps
-                    .$ops
-                    .attach_struct_ops()
-                    .context("Failed to attach struct_ops BPF programs")
-            })
+            .maps
+            .$ops
+            .attach_struct_ops()
+            .context("Failed to attach struct_ops BPF programs")
     }};
 }
 
